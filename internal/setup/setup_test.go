@@ -159,6 +159,40 @@ func TestRunPreviewsCompleteDetectedPlanWithoutMutation(t *testing.T) {
 	}
 }
 
+func TestDiscoverReturnsInteractiveDefaultsWithoutSecretValues(t *testing.T) {
+	directory := t.TempDir()
+	for name, contents := range map[string]string{
+		".env":           "TOKEN=private-value\n",
+		".env.staging":   "TOKEN=other-private-value\n",
+		"package.json":   `{"name":"billing-api","packageManager":"pnpm@9.0.0","scripts":{"dev":"vite","test":"go test ./...","release":"shipit"}}`,
+		"pnpm-lock.yaml": "lockfileVersion: '9.0'\n",
+	} {
+		if err := os.WriteFile(filepath.Join(directory, name), []byte(contents), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	discovery, err := setup.Discover(directory)
+	if err != nil {
+		t.Fatalf("Discover() error = %v", err)
+	}
+	if discovery.ProjectID != "billing-api" || discovery.PackageManager != "pnpm" || discovery.DefaultSource != "local" {
+		t.Errorf("Discover() = %#v, want detected project, package manager, and local source", discovery)
+	}
+	if !reflect.DeepEqual(discovery.SelectedInputs, []string{".env"}) {
+		t.Errorf("selected inputs = %q, want [.env]", discovery.SelectedInputs)
+	}
+	if !reflect.DeepEqual(discovery.SelectedCommands, []string{"dev"}) {
+		t.Errorf("selected commands = %q, want [dev]", discovery.SelectedCommands)
+	}
+	if !reflect.DeepEqual(discovery.ValidationCandidates, []string{"test"}) {
+		t.Errorf("validation candidates = %q, want [test]", discovery.ValidationCandidates)
+	}
+	if strings.Contains(fmt.Sprintf("%#v", discovery), "private-value") {
+		t.Error("discovery leaked a secret value")
+	}
+}
+
 func TestRunRequiresExplicitSourceWithoutPlaintextInput(t *testing.T) {
 	directory := t.TempDir()
 	if err := os.WriteFile(filepath.Join(directory, "package.json"), []byte(`{"name":"billing-api"}`), 0o600); err != nil {

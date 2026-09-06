@@ -77,6 +77,60 @@ type DeveloperCommand struct {
 	Default bool
 }
 
+type Discovery struct {
+	ProjectID            string
+	DefaultSource        string
+	PlaintextInputs      []PlaintextInput
+	SelectedInputs       []string
+	DeveloperCommands    []DeveloperCommand
+	SelectedCommands     []string
+	ValidationCandidates []string
+	PackageManager       string
+}
+
+// Discover returns non-secret project metadata and setup defaults.
+func Discover(directory string) (Discovery, error) {
+	if directory == "" {
+		directory = "."
+	}
+	projectID, err := defaultProjectID(directory)
+	if err != nil {
+		return Discovery{}, err
+	}
+	inputs := detectPlaintextInputs(directory)
+	scripts := candidatePackageScripts(directory)
+	discovery := Discovery{
+		ProjectID:       projectID,
+		PlaintextInputs: inputs,
+		PackageManager:  detectedPackageManager(directory),
+		DefaultSource:   "1password",
+	}
+	if len(inputs) > 0 {
+		discovery.DefaultSource = "local"
+	}
+	for _, input := range inputs {
+		if input.Selected {
+			discovery.SelectedInputs = append(discovery.SelectedInputs, input.Name)
+		}
+	}
+	for _, name := range scripts {
+		command := DeveloperCommand{Name: name, Default: isRuntimeScript(name)}
+		discovery.DeveloperCommands = append(discovery.DeveloperCommands, command)
+		if command.Default {
+			discovery.SelectedCommands = append(discovery.SelectedCommands, name)
+		}
+		if isFiniteValidationScript(name) {
+			discovery.ValidationCandidates = append(discovery.ValidationCandidates, name)
+		}
+	}
+	return discovery, nil
+}
+
+func detectedPackageManager(directory string) string {
+	manager, _ := detectPackageManager(directory)
+	return manager
+}
+
 // Run previews and, after confirmation, applies a non-secret inject configuration.
 func Run(request Request) error {
 	if request.Directory == "" {
