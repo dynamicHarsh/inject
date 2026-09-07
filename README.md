@@ -42,7 +42,10 @@ The binary is written to `./bin/inject`.
 
 ## Quick Start
 
-### Team project: 1Password
+Install `inject` before configuring a project. For a remote source, also install
+the provider CLI and sign in with your existing provider account.
+
+### Team Project: 1Password
 
 Create a Secure Note in your team's 1Password vault. Its body must use standard `.env` syntax:
 
@@ -51,7 +54,8 @@ DATABASE_URL=postgres://...
 API_KEY=...
 ```
 
-Install and sign in to the 1Password CLI, then run setup from the project root. Setup previews the non-secret configuration before making changes.
+Sign in to the 1Password CLI, then run setup from the project root. Setup previews
+the non-secret project configuration and package-script changes before applying them.
 
 ```bash
 op signin
@@ -60,29 +64,47 @@ inject setup \
   --account acme.1password.com \
   --vault Engineering \
   --item acme-web-development \
-  --binding dev \
-  --command npm --command run --command dev:app \
+  --package-script dev \
+  --validate npm --validate test \
   --yes
 ```
 
-Commit the generated `inject.toml`. Each developer signs in to `op` using their own account, then runs the binding:
+Commit the generated `inject.toml` and `package.json` changes. Each developer
+signs in to `op` using their own account, then uses the same project-native
+command they used before setup:
 
 ```bash
-inject dev
+npm run dev
 ```
 
-### Local-only project
+Setup preserves the selected script and its `pre` and `post` lifecycle hooks
+behind an injected wrapper. The equivalent unchanged commands are `pnpm run dev`,
+`yarn dev`, and `bun run dev` when the project declares that package manager.
+Only scripts declared by Node projects in `package.json` can be wrapped this way.
+
+For a command that is not declared in `package.json`, use the explicit fallback:
+
+```bash
+inject run -- npm run db:migrate
+```
+
+### Local-Only Project
 
 From a directory with an existing `.env`, setup imports into macOS Keychain or Linux Secret Service by default. The project ID defaults to the directory name and can be overridden with `--project-id`:
 
 ```bash
 inject setup \
-  --binding dev \
-  --command npm --command run --command dev \
+  --package-script dev \
   --yes
+npm run dev
 ```
 
-The imported values stay in the operating system credential store. They are not shared through `inject.toml`, and `.env` remains unless removal is explicitly requested. Use `--local` to force local source selection when needed.
+The imported values stay in the operating system credential store. They are not
+shared through `inject.toml`, and `.env` remains unless removal is explicitly
+requested with both `--remove-env` and `--yes-remove-env`. Use `--local` to force
+local source selection when needed. Run `inject edit` to add, rename, update, or
+delete values in a local secret set; changes remain in memory until you confirm
+them. Remote secret sets must be edited in their owning provider.
 
 ### One-off command
 
@@ -134,7 +156,9 @@ command = ["npm", "run", "dev"]
 
 ## Providers and Offline Use
 
-Remote secret notes are managed only by their provider. `inject` reuses the authenticated session from the relevant CLI:
+Remote secret notes, access control, authentication, audit history, and rotation
+remain owned by their provider. `inject` stores no provider credentials and
+reuses the authenticated session from the relevant CLI:
 
 - 1Password: `op signin`
 - Bitwarden: `bw login`
@@ -160,15 +184,16 @@ inject setup [flags]
 inject <binding>
 inject run [--profile <name>] [--offline] -- <command> [args...]
 inject remove --yes
-inject edit                 # legacy encrypted-vault workflow
+inject edit
 inject export               # legacy encrypted-vault export
 ```
 
-- `setup` previews and, with `--yes`, creates or updates configuration and optional command bindings. `--local` imports a legacy `.env` into the credential store. Use `--validate` repeatedly to supply a finite validation command; `--remove-env --yes-remove-env` removes a detected legacy `.env` only after validation.
-- `<binding>` runs a named command from `inject.toml` as an injected foreground child process.
-- `run` injects a selected profile into an arbitrary child command. Place all `inject` flags before the child command.
-- `remove --yes` deletes `inject.toml`, this project's local credential-store values, and remote caches. It never deletes remote provider items.
-- `edit` and `export` remain for compatibility with the former encrypted `.env.pull.enc` workflow. New projects should use `setup` instead.
+- `setup` previews and, with `--yes`, creates or updates project configuration and selected `package.json` script bindings. Use `--validate` repeatedly to supply a finite validation command. A rerun is idempotent when generated scripts are unchanged; if an inject-owned script was modified, interactive setup asks whether to retain or replace it, while non-interactive setup stops before mutation.
+- `<binding>` runs an explicit named command declared under `[commands.<name>]` in `inject.toml` as an injected foreground child process.
+- `run` injects a selected profile into an undeclared child command. Place all `inject` flags before the child command.
+- `remove` first previews the project configuration, package scripts, local secret sets, and remote caches it will remove. `--yes` confirms restoration of original scripts and deletion of only that project's local state. It never deletes remote provider items.
+- `edit` changes configured local secret sets without a plaintext temporary file. Remote secret sets remain provider-owned. Without `inject.toml`, it retains compatibility with the legacy encrypted-vault editor.
+- `export` remains for compatibility with the former encrypted `.env.pull.enc` workflow. New projects should use `setup` instead.
 
 Run `inject <command> --help` for detailed flags; because `run` passes its arguments through unchanged, use `inject help run` for that command's help.
 

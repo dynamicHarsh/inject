@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -266,6 +267,175 @@ post_original = "printf 'post:%s\\n' \"$TOKEN\" >> \"$ORDER_FILE\""
 	}
 	if _, err := os.Stat(orderPath); !os.IsNotExist(err) {
 		t.Errorf("lifecycle output stat error = %v, want no process launched", err)
+	}
+}
+
+func TestSetupPreservesDeveloperWorkflowWithoutPersistingSecrets(t *testing.T) {
+	if _, err := exec.LookPath("npm"); err != nil {
+		t.Skip("npm is not installed")
+	}
+	toolsDirectory := t.TempDir()
+	binaryPath := filepath.Join(toolsDirectory, "inject")
+	build := exec.Command("go", "build", "-o", binaryPath, ".")
+	if output, err := build.CombinedOutput(); err != nil {
+		t.Fatalf("build CLI: %v\n%s", err, output)
+	}
+
+	projectDir := t.TempDir()
+	originalManifest := []byte(`{"name":"acceptance-project","scripts":{"predev":"node lifecycle.js pre","dev":"node lifecycle.js main","postdev":"node lifecycle.js post"}}`)
+	if err := os.WriteFile(filepath.Join(projectDir, "package.json"), originalManifest, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	originalLockfile := []byte(`{"lockfileVersion":3}`)
+	if err := os.WriteFile(filepath.Join(projectDir, "package-lock.json"), originalLockfile, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	lifecycle := `require("fs").appendFileSync(process.env.ORDER_FILE, process.argv[2] + ":" + process.env.TOKEN + ":" + process.env.SECOND + "\n")`
+	if err := os.WriteFile(filepath.Join(projectDir, "lifecycle.js"), []byte(lifecycle), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	unrelatedPath := filepath.Join(projectDir, "unrelated.txt")
+	if err := os.WriteFile(unrelatedPath, []byte("keep me"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	orderPath := filepath.Join(projectDir, "order.log")
+	t.Setenv("TOKEN", "parent-token")
+	t.Setenv("SECOND", "parent-second")
+	developerCommand := func() *exec.Cmd {
+		command := exec.Command("npm", "run", "--silent", "dev")
+		command.Dir = projectDir
+		command.Env = append(os.Environ(),
+			"PATH="+toolsDirectory+string(os.PathListSeparator)+os.Getenv("PATH"),
+			"ORDER_FILE="+orderPath,
+		)
+		return command
+	}
+	if output, err := developerCommand().CombinedOutput(); err != nil {
+		t.Fatalf("npm run dev before setup: %v\n%s", err, output)
+	}
+	if got, err := os.ReadFile(orderPath); err != nil || string(got) != "pre:parent-token:parent-second\nmain:parent-token:parent-second\npost:parent-token:parent-second\n" {
+		t.Fatalf("lifecycle before setup = %q, %v", got, err)
+	}
+	if err := os.Remove(orderPath); err != nil {
+		t.Fatal(err)
+	}
+
+	secret := "acceptance-secret-value"
+	secondSecret := "complete-set"
+	opPath := filepath.Join(toolsDirectory, "op")
+	op := "#!/bin/sh\nif [ \"$1\" = account ]; then exit 0; fi\nprintf '%s\\n' '{\"fields\":[{\"id\":\"notesPlain\",\"value\":\"TOKEN=" + secret + "\\nSECOND=" + secondSecret + "\\n\"}]}'\n"
+	if err := os.WriteFile(opPath, []byte(op), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	setup := exec.Command(binaryPath, "setup",
+		"--project-id", "acceptance-project",
+		"--account", "acme", "--vault", "Engineering", "--item-id", "stable-note-id",
+		"--package-script", "dev", "--yes",
+		"--validate=sh", "--validate=-c", `--validate=test -n "$TOKEN" && test -n "$SECOND"`,
+	)
+	setup.Dir = projectDir
+	setup.Env = append(os.Environ(), "PATH="+toolsDirectory+string(os.PathListSeparator)+os.Getenv("PATH"))
+	setupOutput, err := setup.CombinedOutput()
+	if err != nil {
+		t.Fatalf("inject setup: %v\n%s", err, setupOutput)
+	}
+	for _, value := range []string{secret, secondSecret} {
+		if strings.Contains(string(setupOutput), value) {
+			t.Errorf("setup output exposed secret value: %s", setupOutput)
+		}
+	}
+	for _, name := range []string{"inject.toml", "package.json", "package-lock.json"} {
+		contents, err := os.ReadFile(filepath.Join(projectDir, name))
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, value := range []string{secret, secondSecret} {
+			if strings.Contains(string(contents), value) {
+				t.Errorf("%s exposed secret value", name)
+			}
+		}
+	}
+
+	if output, err := developerCommand().CombinedOutput(); err != nil {
+		t.Fatalf("npm run dev after setup: %v\n%s", err, output)
+	}
+	if got, err := os.ReadFile(orderPath); err != nil || string(got) != "pre:"+secret+":"+secondSecret+"\nmain:"+secret+":"+secondSecret+"\npost:"+secret+":"+secondSecret+"\n" {
+		t.Fatalf("injected lifecycle = %q, %v", got, err)
+	}
+	if got := os.Getenv("TOKEN"); got != "parent-token" {
+		t.Errorf("parent TOKEN = %q, want unchanged", got)
+	}
+	if got := os.Getenv("SECOND"); got != "parent-second" {
+		t.Errorf("parent SECOND = %q, want unchanged", got)
+	}
+	if err := os.Remove(orderPath); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := os.WriteFile(opPath, []byte("#!/bin/sh\nexit 1\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	failureOutput, err := developerCommand().CombinedOutput()
+	if err == nil {
+		t.Fatalf("npm run dev succeeded with unavailable source: %s", failureOutput)
+	}
+	for _, value := range []string{secret, secondSecret} {
+		if strings.Contains(string(failureOutput), value) {
+			t.Errorf("source failure exposed secret value: %s", failureOutput)
+		}
+	}
+	if _, err := os.Stat(orderPath); !os.IsNotExist(err) {
+		t.Errorf("lifecycle output stat error = %v, want no process launched", err)
+	}
+
+	remove := exec.Command(binaryPath, "remove", "--yes")
+	remove.Dir = projectDir
+	remove.Env = setup.Env
+	removeOutput, err := remove.CombinedOutput()
+	if err != nil {
+		t.Fatalf("inject remove: %v\n%s", err, removeOutput)
+	}
+	for _, value := range []string{secret, secondSecret} {
+		if strings.Contains(string(removeOutput), value) {
+			t.Errorf("remove output exposed secret value: %s", removeOutput)
+		}
+	}
+	if _, err := os.Stat(filepath.Join(projectDir, "inject.toml")); !os.IsNotExist(err) {
+		t.Errorf("inject.toml stat error = %v, want removed", err)
+	}
+	restoredManifest, err := os.ReadFile(filepath.Join(projectDir, "package.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var restored struct {
+		Name    string            `json:"name"`
+		Scripts map[string]string `json:"scripts"`
+	}
+	if err := json.Unmarshal(restoredManifest, &restored); err != nil {
+		t.Fatal(err)
+	}
+	wantScripts := map[string]string{
+		"predev":  "node lifecycle.js pre",
+		"dev":     "node lifecycle.js main",
+		"postdev": "node lifecycle.js post",
+	}
+	if len(restored.Scripts) != len(wantScripts) {
+		t.Errorf("restored scripts = %#v, want %#v", restored.Scripts, wantScripts)
+	}
+	for name, want := range wantScripts {
+		if got := restored.Scripts[name]; got != want {
+			t.Errorf("restored script %q = %q, want %q", name, got, want)
+		}
+	}
+	if restored.Name != "acceptance-project" {
+		t.Errorf("restored package name = %q, want acceptance-project", restored.Name)
+	}
+	if got, err := os.ReadFile(filepath.Join(projectDir, "package-lock.json")); err != nil || string(got) != string(originalLockfile) {
+		t.Errorf("package-lock.json = %q, %v; want unchanged", got, err)
+	}
+	if got, err := os.ReadFile(unrelatedPath); err != nil || string(got) != "keep me" {
+		t.Errorf("unrelated project state = %q, %v; want unchanged", got, err)
 	}
 }
 

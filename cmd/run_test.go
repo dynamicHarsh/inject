@@ -2,6 +2,7 @@ package cmd
 
 import (
 	"bytes"
+	"encoding/json"
 	"errors"
 	"io"
 	"os"
@@ -243,6 +244,12 @@ item_id = "stable-note-id"
 	if err := credentialStore.PutCache("billing-api", "remote", map[string]string{"TOKEN": "cached-value"}, time.Now()); err != nil {
 		t.Fatal(err)
 	}
+	if err := credentialStore.Put("other-project", "default", map[string]string{"TOKEN": "other-value"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := credentialStore.PutCache("other-project", "remote", map[string]string{"TOKEN": "other-cache"}, time.Now()); err != nil {
+		t.Fatal(err)
+	}
 
 	if err := runRemove(directory, credentialStore, true, io.Discard); err != nil {
 		t.Fatalf("runRemove() error = %v", err)
@@ -257,6 +264,12 @@ item_id = "stable-note-id"
 	}
 	if _, _, err := credentialStore.GetCache("billing-api", "remote"); err == nil {
 		t.Error("remote cache remains available")
+	}
+	if _, err := credentialStore.Get("other-project", "default"); err != nil {
+		t.Errorf("other project's local secret set was removed: %v", err)
+	}
+	if _, _, err := credentialStore.GetCache("other-project", "remote"); err != nil {
+		t.Errorf("other project's remote cache was removed: %v", err)
 	}
 }
 
@@ -302,6 +315,160 @@ item_id = "stable-note-id"
 	}
 }
 
+func TestRunRemovePreviewsPackageScriptRestorationWithoutMutation(t *testing.T) {
+	directory := t.TempDir()
+	config := `format_version = 1
+project_id = "billing-api"
+
+[profiles.default]
+provider = "local"
+
+[script_bindings.dev]
+profile = "default"
+package_manager = "npm"
+wrapper = "inject __run-package-script \"dev\""
+script = "inject:original:dev"
+original = "vite"
+pre_script = "inject:original:predev"
+pre_original = "prepare"
+`
+	if err := os.WriteFile(filepath.Join(directory, project.FileName), []byte(config), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	manifest := []byte(`{"scripts":{"predev":"","dev":"inject __run-package-script \"dev\"","inject:original:predev":"prepare","inject:original:dev":"vite"}}`)
+	manifestPath := filepath.Join(directory, "package.json")
+	if err := os.WriteFile(manifestPath, manifest, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	var output bytes.Buffer
+	err := runRemove(directory, store.NewMemory(), false, &output)
+	if err == nil {
+		t.Fatal("runRemove() error = nil, want confirmation error")
+	}
+	if got := output.String(); !containsAll(got, `restore package.json script "dev"`, `restore package.json lifecycle hook "predev"`, `delete reserved package.json entry "inject:original:dev"`, `delete reserved package.json entry "inject:original:predev"`) || containsAny(got, "vite", "prepare") {
+		t.Errorf("preview = %q, want non-secret manifest restoration", got)
+	}
+	if got, readErr := os.ReadFile(manifestPath); readErr != nil || !bytes.Equal(got, manifest) {
+		t.Errorf("package.json = %q, %v; want unchanged", got, readErr)
+	}
+}
+
+func TestRunRemoveRestoresOwnedPackageScripts(t *testing.T) {
+	directory := t.TempDir()
+	config := `format_version = 1
+project_id = "billing-api"
+
+[profiles.default]
+provider = "local"
+
+[script_bindings.dev]
+profile = "default"
+package_manager = "npm"
+wrapper = "inject __run-package-script \"dev\""
+script = "inject:original:dev"
+original = "vite --host 0.0.0.0 | tee app.log"
+pre_script = "inject:original:predev"
+pre_original = "printf 'ready\\n'"
+post_script = "inject:original:postdev"
+post_original = "node -e \"console.log('done')\""
+`
+	if err := os.WriteFile(filepath.Join(directory, project.FileName), []byte(config), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	manifestPath := filepath.Join(directory, "package.json")
+	manifest := `{"name":"billing-api","scripts":{"dev":"inject __run-package-script \"dev\"","inject:original:dev":"vite --host 0.0.0.0 | tee app.log","inject:original:predev":"printf 'ready\\n'","inject:original:postdev":"node -e \"console.log('done')\"","test":"go test ./..."}}`
+	if err := os.WriteFile(manifestPath, []byte(manifest), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := runRemove(directory, store.NewMemory(), true, io.Discard); err != nil {
+		t.Fatalf("runRemove() error = %v", err)
+	}
+	data, err := os.ReadFile(manifestPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var restored struct {
+		Name    string            `json:"name"`
+		Scripts map[string]string `json:"scripts"`
+	}
+	if err := json.Unmarshal(data, &restored); err != nil {
+		t.Fatal(err)
+	}
+	want := map[string]string{
+		"predev":  `printf 'ready\n'`,
+		"dev":     "vite --host 0.0.0.0 | tee app.log",
+		"postdev": `node -e "console.log('done')"`,
+		"test":    "go test ./...",
+	}
+	if restored.Name != "billing-api" || !reflect.DeepEqual(restored.Scripts, want) {
+		t.Errorf("package.json = %#v, want name and restored scripts %#v", restored, want)
+	}
+}
+
+func TestRunRemoveRefusesOwnedPackageScriptConflictsBeforeMutation(t *testing.T) {
+	tests := []struct {
+		name       string
+		conflicted string
+		value      string
+	}{
+		{name: "wrapper", conflicted: "dev", value: "manual wrapper"},
+		{name: "preserved entry", conflicted: "inject:original:dev", value: "manual original"},
+		{name: "lifecycle hook", conflicted: "predev", value: "manual hook"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			directory := t.TempDir()
+			config := `format_version = 1
+project_id = "billing-api"
+
+[profiles.default]
+provider = "local"
+
+[script_bindings.dev]
+profile = "default"
+package_manager = "npm"
+wrapper = "inject __run-package-script \"dev\""
+script = "inject:original:dev"
+original = "vite"
+`
+			configPath := filepath.Join(directory, project.FileName)
+			if err := os.WriteFile(configPath, []byte(config), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			scripts := map[string]string{"dev": `inject __run-package-script "dev"`, "inject:original:dev": "vite"}
+			scripts[test.conflicted] = test.value
+			manifest, err := json.Marshal(map[string]any{"scripts": scripts})
+			if err != nil {
+				t.Fatal(err)
+			}
+			manifestPath := filepath.Join(directory, "package.json")
+			if err := os.WriteFile(manifestPath, manifest, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			credentialStore := store.NewMemory()
+			if err := credentialStore.Put("billing-api", "default", map[string]string{"TOKEN": "secret"}); err != nil {
+				t.Fatal(err)
+			}
+
+			err = runRemove(directory, credentialStore, true, io.Discard)
+			if err == nil || !strings.Contains(err.Error(), test.conflicted) {
+				t.Fatalf("runRemove() error = %v, want conflict for %q", err, test.conflicted)
+			}
+			if got, readErr := os.ReadFile(manifestPath); readErr != nil || !bytes.Equal(got, manifest) {
+				t.Errorf("package.json = %q, %v; want unchanged", got, readErr)
+			}
+			if _, statErr := os.Stat(configPath); statErr != nil {
+				t.Errorf("inject.toml stat error = %v, want preserved", statErr)
+			}
+			if _, getErr := credentialStore.Get("billing-api", "default"); getErr != nil {
+				t.Errorf("local profile unavailable after conflict: %v", getErr)
+			}
+		})
+	}
+}
+
 func TestRunRemoveFailurePreservesConfigurationAndOtherProjects(t *testing.T) {
 	directory := t.TempDir()
 	config := `format_version = 1
@@ -309,9 +476,21 @@ project_id = "billing-api"
 
 [profiles.local]
 provider = "local"
+
+[script_bindings.dev]
+profile = "local"
+package_manager = "npm"
+wrapper = "inject __run-package-script \"dev\""
+script = "inject:original:dev"
+original = "vite"
 `
 	if err := os.WriteFile(filepath.Join(directory, project.FileName), []byte(config), 0o600); err != nil {
 		t.Fatalf("write config: %v", err)
+	}
+	manifest := []byte(`{"scripts":{"dev":"inject __run-package-script \"dev\"","inject:original:dev":"vite"}}`)
+	manifestPath := filepath.Join(directory, "package.json")
+	if err := os.WriteFile(manifestPath, manifest, 0o600); err != nil {
+		t.Fatal(err)
 	}
 	credentialStore := &failingDeleteStore{Store: store.NewMemory()}
 	if err := credentialStore.Put("billing-api", "local", map[string]string{"TOKEN": "local-value"}); err != nil {
@@ -335,6 +514,77 @@ provider = "local"
 	if _, err := credentialStore.Get("other-project", "local"); err != nil {
 		t.Errorf("other project profile unavailable after failed removal: %v", err)
 	}
+	if got, readErr := os.ReadFile(manifestPath); readErr != nil || !bytes.Equal(got, manifest) {
+		t.Errorf("package.json = %q, %v; want rolled back", got, readErr)
+	}
+}
+
+func TestRunRemoveRollsBackPartialCredentialCleanup(t *testing.T) {
+	directory := t.TempDir()
+	config := `format_version = 1
+project_id = "billing-api"
+
+[profiles.local]
+provider = "local"
+
+[profiles.remote]
+provider = "bitwarden"
+item_id = "remote-item"
+`
+	configPath := filepath.Join(directory, project.FileName)
+	if err := os.WriteFile(configPath, []byte(config), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	credentialStore := &failingCacheDeleteStore{Store: store.NewMemory()}
+	localSecrets := map[string]string{"TOKEN": "local-value"}
+	if err := credentialStore.Put("billing-api", "local", localSecrets); err != nil {
+		t.Fatal(err)
+	}
+	if err := credentialStore.PutCache("billing-api", "remote", map[string]string{"TOKEN": "cached-value"}, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+
+	err := runRemove(directory, credentialStore, true, io.Discard)
+	if err == nil {
+		t.Fatal("runRemove() error = nil, want cache deletion failure")
+	}
+	if got, getErr := credentialStore.Get("billing-api", "local"); getErr != nil || !reflect.DeepEqual(got, localSecrets) {
+		t.Errorf("local profile = %q, %v; want restored", got, getErr)
+	}
+	if _, _, getErr := credentialStore.GetCache("billing-api", "remote"); getErr != nil {
+		t.Errorf("remote cache unavailable after rollback: %v", getErr)
+	}
+	if _, statErr := os.Stat(configPath); statErr != nil {
+		t.Errorf("inject.toml stat error = %v, want preserved", statErr)
+	}
+}
+
+func TestRunRemoveDeletesConfigurationAfterCredentialCleanup(t *testing.T) {
+	directory := t.TempDir()
+	configPath := filepath.Join(directory, project.FileName)
+	config := `format_version = 1
+project_id = "billing-api"
+
+[profiles.default]
+provider = "local"
+`
+	if err := os.WriteFile(configPath, []byte(config), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	credentialStore := &configAwareStore{Store: store.NewMemory(), configPath: configPath}
+	if err := credentialStore.Put("billing-api", "default", map[string]string{"TOKEN": "secret"}); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := runRemove(directory, credentialStore, true, io.Discard); err != nil {
+		t.Fatalf("runRemove() error = %v", err)
+	}
+	if !credentialStore.configPresentDuringDelete {
+		t.Error("inject.toml was not present during credential deletion")
+	}
+	if _, err := os.Stat(configPath); !os.IsNotExist(err) {
+		t.Errorf("inject.toml stat error = %v, want deleted", err)
+	}
 }
 
 type failingDeleteStore struct {
@@ -343,6 +593,26 @@ type failingDeleteStore struct {
 
 func (store *failingDeleteStore) Delete(string, string) error {
 	return errors.New("credential store unavailable")
+}
+
+type failingCacheDeleteStore struct {
+	store.Store
+}
+
+func (store *failingCacheDeleteStore) DeleteCache(string, string) error {
+	return errors.New("cache deletion unavailable")
+}
+
+type configAwareStore struct {
+	store.Store
+	configPath                string
+	configPresentDuringDelete bool
+}
+
+func (store *configAwareStore) Delete(projectID, profile string) error {
+	_, err := os.Stat(store.configPath)
+	store.configPresentDuringDelete = err == nil
+	return store.Store.Delete(projectID, profile)
 }
 
 func containsAll(value string, substrings ...string) bool {
