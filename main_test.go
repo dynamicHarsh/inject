@@ -5,8 +5,10 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestCLIIdentity(t *testing.T) {
@@ -176,7 +178,8 @@ item_id = "stable-note-id"
 }
 
 func TestConfiguredPackageScriptRunsLifecycleInsideInjectedProcessTree(t *testing.T) {
-	if _, err := exec.LookPath("npm"); err != nil {
+	npmPath, err := exec.LookPath("npm")
+	if err != nil {
 		t.Skip("npm is not installed")
 	}
 	buildDirectory := t.TempDir()
@@ -207,11 +210,22 @@ pre_original = "printf 'pre:%s\\n' \"$TOKEN\" >> \"$ORDER_FILE\""
 post_script = "inject:original:postdev"
 post_original = "printf 'post:%s\\n' \"$TOKEN\" >> \"$ORDER_FILE\""
 `
-	manifest := `{"scripts":{"dev":"inject __run-package-script \"dev\"","inject:original:predev":"printf 'pre:%s\\n' \"$TOKEN\" >> \"$ORDER_FILE\"","inject:original:dev":"printf 'main:%s\\n' \"$TOKEN\" >> \"$ORDER_FILE\"","inject:original:postdev":"printf 'post:%s\\n' \"$TOKEN\" >> \"$ORDER_FILE\""}}`
+	manifest := `{"scripts":{"dev":"inject __run-package-script \"dev\"","inject:original:predev":"sh lifecycle.sh pre","inject:original:dev":"sh lifecycle.sh main","inject:original:postdev":"sh lifecycle.sh post"}}`
 	if err := os.WriteFile(filepath.Join(projectDir, "inject.toml"), []byte(config), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(filepath.Join(projectDir, "package.json"), []byte(manifest), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	lifecycle := `#!/bin/sh
+stage=$1
+shift
+printf '%s:%s:%s:%s\n' "$stage" "$TOKEN" "$PWD" "$#" >> "$ORDER_FILE"
+for argument in "$@"; do
+  printf 'arg:%s\n' "$argument" >> "$ORDER_FILE"
+done
+`
+	if err := os.WriteFile(filepath.Join(projectDir, "lifecycle.sh"), []byte(lifecycle), 0o700); err != nil {
 		t.Fatal(err)
 	}
 	opPath := filepath.Join(projectDir, "op")
@@ -219,8 +233,12 @@ post_original = "printf 'post:%s\\n' \"$TOKEN\" >> \"$ORDER_FILE\""
 		t.Fatal(err)
 	}
 	orderPath := filepath.Join(projectDir, "order.log")
-	command := exec.Command("npm", "run", "--silent", "dev")
-	command.Dir = projectDir
+	nestedDir := filepath.Join(projectDir, "nested", "directory")
+	if err := os.MkdirAll(nestedDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	command := exec.Command("npm", "run", "--silent", "dev", "--", "first value", "--flag")
+	command.Dir = nestedDir
 	command.Env = append(os.Environ(),
 		"PATH="+projectDir+string(os.PathListSeparator)+buildDirectory+string(os.PathListSeparator)+os.Getenv("PATH"),
 		"ORDER_FILE="+orderPath,
@@ -233,7 +251,15 @@ post_original = "printf 'post:%s\\n' \"$TOKEN\" >> \"$ORDER_FILE\""
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got, want := string(order), "pre:injected-value\nmain:injected-value\npost:injected-value\n"; got != want {
+	canonicalProjectDir, err := filepath.EvalSymlinks(projectDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := "pre:injected-value:" + canonicalProjectDir + ":0\n" +
+		"main:injected-value:" + canonicalProjectDir + ":2\n" +
+		"arg:first value\narg:--flag\n" +
+		"post:injected-value:" + canonicalProjectDir + ":0\n"
+	if got := string(order); got != want {
 		t.Errorf("lifecycle output = %q, want %q", got, want)
 	}
 	if got := os.Getenv("TOKEN"); got == "injected-value" {
@@ -267,6 +293,27 @@ post_original = "printf 'post:%s\\n' \"$TOKEN\" >> \"$ORDER_FILE\""
 	}
 	if _, err := os.Stat(orderPath); !os.IsNotExist(err) {
 		t.Errorf("lifecycle output stat error = %v, want no process launched", err)
+	}
+
+	nodePath, err := exec.LookPath("node")
+	if err != nil {
+		t.Skip("node is not installed")
+	}
+	isolatedPath := t.TempDir()
+	if err := os.Symlink(nodePath, filepath.Join(isolatedPath, "node")); err != nil {
+		t.Fatal(err)
+	}
+	missingInject := exec.Command(npmPath, "run", "--silent", "dev")
+	missingInject.Dir = nestedDir
+	missingInject.Env = append(os.Environ(),
+		"PATH="+isolatedPath+string(os.PathListSeparator)+"/usr/bin:/bin",
+		"ORDER_FILE="+orderPath,
+	)
+	if output, err := missingInject.CombinedOutput(); err == nil {
+		t.Fatalf("npm run dev = success without inject on PATH; output: %s", output)
+	}
+	if _, err := os.Stat(orderPath); !os.IsNotExist(err) {
+		t.Errorf("lifecycle output stat error = %v, want no process launched without inject", err)
 	}
 }
 
@@ -479,9 +526,21 @@ post_original = "preserved post script"
 			managerPath := filepath.Join(projectDir, manager)
 			managerScript := `#!/bin/sh
 case "$2" in
-  inject:original:predev) printf 'pre:%s\n' "$TOKEN" >> "$ORDER_FILE" ;;
-  inject:original:dev) printf 'main:%s\n' "$TOKEN" >> "$ORDER_FILE"; exit "${MAIN_EXIT:-0}" ;;
-  inject:original:postdev) printf 'post:%s\n' "$TOKEN" >> "$ORDER_FILE" ;;
+		dev)
+			shift 2
+			if [ "$1" = "--" ]; then shift; fi
+			cd "$PROJECT_ROOT"
+			exec "$INJECT_BINARY" __run-package-script dev "$@"
+			;;
+	inject:original:predev) : > pre.cwd; printf 'pre:%s\n' "$TOKEN" >> "$ORDER_FILE" ;;
+	inject:original:dev)
+		shift 3
+		: > main.cwd
+		printf 'main:%s:%s\n' "$TOKEN" "$#" >> "$ORDER_FILE"
+		for argument in "$@"; do printf 'arg:%s\n' "$argument" >> "$ORDER_FILE"; done
+		exit "${MAIN_EXIT:-0}"
+		;;
+	inject:original:postdev) : > post.cwd; printf 'post:%s\n' "$TOKEN" >> "$ORDER_FILE" ;;
   *) exit 64 ;;
 esac
 `
@@ -489,15 +548,21 @@ esac
 				t.Fatal(err)
 			}
 			orderPath := filepath.Join(projectDir, "order.log")
+			nestedDir := filepath.Join(projectDir, "nested", "directory")
+			if err := os.MkdirAll(nestedDir, 0o700); err != nil {
+				t.Fatal(err)
+			}
 			environment := []string{
 				"PATH=" + projectDir,
 				"npm_execpath=" + managerPath,
 				"npm_config_user_agent=" + manager + "/1.0.0",
 				"ORDER_FILE=" + orderPath,
+				"PROJECT_ROOT=" + projectDir,
+				"INJECT_BINARY=" + binaryPath,
 				"TOKEN=parent-value",
 			}
-			command := exec.Command(binaryPath, "__run-package-script", "dev")
-			command.Dir = projectDir
+			command := exec.Command(managerPath, "run", "dev", "--", "first value", "--flag")
+			command.Dir = nestedDir
 			command.Env = environment
 			if output, err := command.CombinedOutput(); err != nil {
 				t.Fatalf("run package script: %v\n%s", err, output)
@@ -506,15 +571,23 @@ esac
 			if err != nil {
 				t.Fatal(err)
 			}
-			if got, want := string(order), "pre:injected-value\nmain:injected-value\npost:injected-value\n"; got != want {
+			if got, want := string(order), "pre:injected-value\nmain:injected-value:2\narg:first value\narg:--flag\npost:injected-value\n"; got != want {
 				t.Errorf("lifecycle output = %q, want %q", got, want)
+			}
+			for _, stage := range []string{"pre", "main", "post"} {
+				if _, err := os.Stat(filepath.Join(projectDir, stage+".cwd")); err != nil {
+					t.Errorf("%s lifecycle did not run from project root: %v", stage, err)
+				}
+				if _, err := os.Stat(filepath.Join(nestedDir, stage+".cwd")); !os.IsNotExist(err) {
+					t.Errorf("%s lifecycle marker found in nested invocation directory", stage)
+				}
 			}
 
 			if err := os.Remove(orderPath); err != nil {
 				t.Fatal(err)
 			}
-			exitCommand := exec.Command(binaryPath, "__run-package-script", "dev")
-			exitCommand.Dir = projectDir
+			exitCommand := exec.Command(managerPath, "run", "dev")
+			exitCommand.Dir = nestedDir
 			exitCommand.Env = append(environment, "MAIN_EXIT=7")
 			if output, err := exitCommand.CombinedOutput(); err == nil {
 				t.Fatalf("run package script = success, want exit status 7; output: %s", output)
@@ -522,6 +595,110 @@ esac
 				t.Fatalf("run package script error = %v, want exit status 7; output: %s", err, output)
 			}
 		})
+	}
+}
+
+func TestConfiguredPackageScriptForwardsSignals(t *testing.T) {
+	buildDirectory := t.TempDir()
+	binaryPath := filepath.Join(buildDirectory, "inject")
+	build := exec.Command("go", "build", "-o", binaryPath, ".")
+	if output, err := build.CombinedOutput(); err != nil {
+		t.Fatalf("build CLI: %v\n%s", err, output)
+	}
+
+	projectDir := t.TempDir()
+	config := `format_version = 1
+project_id = "test-project"
+
+[profiles.default]
+provider = "1password"
+account = "acme"
+vault = "Engineering"
+item_id = "stable-note-id"
+
+[script_bindings.dev]
+profile = "default"
+package_manager = "npm"
+wrapper = "inject __run-package-script \"dev\""
+script = "inject:original:dev"
+original = "long-running process"
+`
+	if err := os.WriteFile(filepath.Join(projectDir, "inject.toml"), []byte(config), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(projectDir, "op"), []byte("#!/bin/sh\nprintf '%s\\n' '{\"fields\":[{\"id\":\"notesPlain\",\"value\":\"TOKEN=injected-value\\n\"}]}'\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	managerPath := filepath.Join(projectDir, "npm")
+	managerScript := `#!/bin/sh
+if [ "$2" = "dev" ]; then
+  cd "$PROJECT_ROOT"
+  exec "$INJECT_BINARY" __run-package-script dev
+fi
+echo $$ > "$CHILD_PID_FILE"
+trap 'echo interrupt > "$SIGNAL_FILE"; exit 23' INT
+touch "$READY_FILE"
+while :; do sleep 1; done
+`
+	if err := os.WriteFile(managerPath, []byte(managerScript), 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	readyPath := filepath.Join(projectDir, "ready")
+	signalPath := filepath.Join(projectDir, "signal")
+	childPIDPath := filepath.Join(projectDir, "child.pid")
+	nestedDir := filepath.Join(projectDir, "nested", "directory")
+	if err := os.MkdirAll(nestedDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	command := exec.Command(managerPath, "run", "dev")
+	command.Dir = nestedDir
+	command.Env = []string{
+		"PATH=" + projectDir + string(os.PathListSeparator) + os.Getenv("PATH"),
+		"npm_execpath=" + managerPath,
+		"npm_config_user_agent=npm/1.0.0",
+		"PROJECT_ROOT=" + projectDir,
+		"INJECT_BINARY=" + binaryPath,
+		"READY_FILE=" + readyPath,
+		"SIGNAL_FILE=" + signalPath,
+		"CHILD_PID_FILE=" + childPIDPath,
+	}
+	if err := command.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		data, err := os.ReadFile(childPIDPath)
+		if err != nil {
+			return
+		}
+		pid, err := strconv.Atoi(strings.TrimSpace(string(data)))
+		if err == nil {
+			if process, findErr := os.FindProcess(pid); findErr == nil {
+				_ = process.Kill()
+			}
+		}
+	})
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if _, err := os.Stat(readyPath); err == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			_ = command.Process.Kill()
+			t.Fatal("retained main script did not start")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if err := command.Process.Signal(os.Interrupt); err != nil {
+		t.Fatal(err)
+	}
+	err := command.Wait()
+	exitError, ok := err.(*exec.ExitError)
+	if !ok || exitError.ExitCode() != 23 {
+		t.Fatalf("inject exit error = %v, want retained child exit status 23", err)
+	}
+	if got, err := os.ReadFile(signalPath); err != nil || string(got) != "interrupt\n" {
+		t.Fatalf("signal marker = %q, %v; want forwarded interrupt", got, err)
 	}
 }
 
