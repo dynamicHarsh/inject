@@ -244,6 +244,12 @@ item_id = "stable-note-id"
 	if err := credentialStore.PutCache("billing-api", "remote", map[string]string{"TOKEN": "cached-value"}, time.Now()); err != nil {
 		t.Fatal(err)
 	}
+	if err := credentialStore.Put("other-project", "default", map[string]string{"TOKEN": "other-value"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := credentialStore.PutCache("other-project", "remote", map[string]string{"TOKEN": "other-cache"}, time.Now()); err != nil {
+		t.Fatal(err)
+	}
 
 	if err := runRemove(directory, credentialStore, true, io.Discard); err != nil {
 		t.Fatalf("runRemove() error = %v", err)
@@ -258,6 +264,12 @@ item_id = "stable-note-id"
 	}
 	if _, _, err := credentialStore.GetCache("billing-api", "remote"); err == nil {
 		t.Error("remote cache remains available")
+	}
+	if _, err := credentialStore.Get("other-project", "default"); err != nil {
+		t.Errorf("other project's local secret set was removed: %v", err)
+	}
+	if _, _, err := credentialStore.GetCache("other-project", "remote"); err != nil {
+		t.Errorf("other project's remote cache was removed: %v", err)
 	}
 }
 
