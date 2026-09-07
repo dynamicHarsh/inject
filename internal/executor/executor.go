@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"os/signal"
+	"syscall"
 )
 
 // RunCommand executes the given command as a child process, injecting secrets
@@ -33,7 +35,26 @@ func RunCommand(command []string, secrets map[string]string) error {
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 
-	if err := cmd.Run(); err != nil {
+	signals := make(chan os.Signal, 1)
+	signal.Notify(signals, os.Interrupt, syscall.SIGTERM)
+	defer signal.Stop(signals)
+	if err := cmd.Start(); err != nil {
+		return fmt.Errorf("executor: command failed: %w", err)
+	}
+	done := make(chan struct{})
+	defer close(done)
+	go func() {
+		for {
+			select {
+			case received := <-signals:
+				_ = cmd.Process.Signal(received)
+			case <-done:
+				return
+			}
+		}
+	}()
+
+	if err := cmd.Wait(); err != nil {
 		return fmt.Errorf("executor: command failed: %w", err)
 	}
 	return nil

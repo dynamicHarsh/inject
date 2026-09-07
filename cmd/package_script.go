@@ -13,9 +13,10 @@ import (
 )
 
 var packageScriptCmd = &cobra.Command{
-	Use:    "__run-package-script <name>",
-	Hidden: true,
-	Args:   cobra.ExactArgs(1),
+	Use:                "__run-package-script <name> [args...]",
+	Hidden:             true,
+	DisableFlagParsing: true,
+	Args:               cobra.MinimumNArgs(1),
 	RunE: func(_ *cobra.Command, args []string) error {
 		config, err := project.Find()
 		if err != nil {
@@ -37,7 +38,12 @@ var packageScriptCmd = &cobra.Command{
 			if script == "" {
 				continue
 			}
-			if err := runChild([]string{manager, "run", script}, secrets); err != nil {
+			command := []string{manager, "run", script}
+			if script == binding.Script && len(args) > 1 {
+				command = append(command, "--")
+				command = append(command, args[1:]...)
+			}
+			if err := runChild(command, secrets); err != nil {
 				return fmt.Errorf("package script %q: %w", args[0], err)
 			}
 		}
