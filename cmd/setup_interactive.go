@@ -13,6 +13,26 @@ import (
 
 var errSetupCancelled = errors.New("setup cancelled")
 
+func parsePackageScriptCommand(command string) (string, string, error) {
+	if strings.ContainsAny(command, "|&;<>") {
+		return "", "", fmt.Errorf("unsupported developer command %q: shell expressions are not supported", command)
+	}
+	fields := strings.Fields(command)
+	if len(fields) == 3 && fields[1] == "run" {
+		switch fields[0] {
+		case "npm", "pnpm", "yarn", "bun":
+			return fields[0], fields[2], nil
+		}
+	}
+	if len(fields) == 2 {
+		switch fields[0] {
+		case "pnpm", "yarn":
+			return fields[0], fields[1], nil
+		}
+	}
+	return "", "", fmt.Errorf("unsupported developer command %q: enter an npm, pnpm, Yarn, or Bun package-script invocation", command)
+}
+
 func runGuidedSetup(
 	request setupworkflow.Request,
 	discover func(string) (setupworkflow.Discovery, error),
@@ -56,6 +76,19 @@ func promptSetupWithIO(discovery setupworkflow.Discovery, request setupworkflow.
 	if request.PackageScripts != nil {
 		selectedCommands = append([]string(nil), request.PackageScripts...)
 	}
+	primaryScript := ""
+	if len(selectedCommands) > 0 {
+		primaryScript = selectedCommands[0]
+	} else {
+		for _, command := range discovery.DeveloperCommands {
+			if command.Default {
+				primaryScript = command.Name
+				break
+			}
+		}
+	}
+	primaryCommand := formatPackageScriptCommand(discovery.PackageManager, primaryScript)
+	additionalCommands := withoutCommand(selectedCommands, primaryScript)
 	validationChoice := ""
 	customValidation := strings.Join(request.Validate, " ")
 	if len(request.Validate) > 0 {
@@ -109,8 +142,12 @@ func promptSetupWithIO(discovery setupworkflow.Discovery, request setupworkflow.
 				}),
 		).Title("Profiles").WithHide(len(inputOptions) == 0),
 		huh.NewGroup(
-			huh.NewMultiSelect[string]().Title("Developer commands").Description("Likely runtime commands are preselected").Options(commandOptions...).Value(&selectedCommands),
-		).Title("Commands").WithHide(len(commandOptions) == 0),
+			huh.NewInput().Title("Primary developer command").Description("Confirm or enter a package-script command").Value(&primaryCommand).
+				Validate(func(value string) error { return validatePrimaryCommand(value, discovery) }),
+		).Title("Primary command"),
+		huh.NewGroup(
+			huh.NewMultiSelect[string]().Title("Additional developer commands").Description("Space toggles a selection").Options(commandOptions...).Value(&additionalCommands),
+		).Title("Additional commands").WithHide(len(commandOptions) == 0),
 		huh.NewGroup(
 			huh.NewSelect[string]().Title("Finite validation command").Options(validationOptions...).Value(&validationChoice),
 		).Title("Validation"),
@@ -122,7 +159,9 @@ func promptSetupWithIO(discovery setupworkflow.Discovery, request setupworkflow.
 		).Title("Cleanup").WithHide(!hasInput(discovery.PlaintextInputs, ".env")),
 		huh.NewGroup(
 			huh.NewNote().Title("Review setup").DescriptionFunc(func() string {
-				return setupReview(projectID, source, selectedInputs, selectedCommands, validationChoice, customValidation, discovery.PackageManager, removePlaintext)
+				_, currentPrimary, _ := parsePackageScriptCommand(primaryCommand)
+				commands := append([]string{currentPrimary}, withoutCommand(additionalCommands, currentPrimary)...)
+				return setupReview(projectID, source, selectedInputs, commands, validationChoice, customValidation, discovery.PackageManager, removePlaintext)
 			}, nil),
 			huh.NewConfirm().Title("Apply these changes?").Value(&confirmed).Affirmative("Apply").Negative("Cancel"),
 		).Title("Review"),
@@ -145,7 +184,8 @@ func promptSetupWithIO(discovery setupworkflow.Discovery, request setupworkflow.
 		request.Provider = ""
 	}
 	request.SelectedInputs = selectedInputs
-	request.PackageScripts = selectedCommands
+	_, primaryScript, _ = parsePackageScriptCommand(primaryCommand)
+	request.PackageScripts = append([]string{primaryScript}, withoutCommand(additionalCommands, primaryScript)...)
 	request.Validate = selectedValidation(validationChoice, customValidation, discovery.PackageManager)
 	request.Confirm = confirmed
 	request.RemoveLegacyEnv = removePlaintext
@@ -215,6 +255,45 @@ func formatValidation(manager, name string) string {
 		return name
 	}
 	return manager + " run " + name
+}
+
+func formatPackageScriptCommand(manager, script string) string {
+	if manager == "" || script == "" {
+		return ""
+	}
+	if manager == "yarn" {
+		return manager + " " + script
+	}
+	return manager + " run " + script
+}
+
+func validatePrimaryCommand(command string, discovery setupworkflow.Discovery) error {
+	manager, script, err := parsePackageScriptCommand(command)
+	if err != nil {
+		return err
+	}
+	if manager != discovery.PackageManager {
+		return fmt.Errorf("developer command uses %s, but this package uses %s", manager, discovery.PackageManager)
+	}
+	for _, candidate := range discovery.DeveloperCommands {
+		if candidate.Name == script {
+			return nil
+		}
+	}
+	return fmt.Errorf("package.json has no %q script", script)
+}
+
+func withoutCommand(commands []string, excluded string) []string {
+	filtered := make([]string, 0, len(commands))
+	seen := make(map[string]bool, len(commands))
+	for _, command := range commands {
+		if command == excluded || seen[command] {
+			continue
+		}
+		seen[command] = true
+		filtered = append(filtered, command)
+	}
+	return filtered
 }
 
 func hasInput(inputs []setupworkflow.PlaintextInput, name string) bool {

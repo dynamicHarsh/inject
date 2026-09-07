@@ -1,8 +1,10 @@
 package cmd
 
 import (
+	"fmt"
 	"io"
 	"os"
+	"strings"
 
 	"github.com/charmbracelet/x/term"
 	"github.com/spf13/cobra"
@@ -13,6 +15,7 @@ import (
 
 var (
 	setupInput            io.Reader = os.Stdin
+	setupPackageRoot      string
 	setupProjectID        string
 	setupProvider         string
 	setupAccount          string
@@ -44,25 +47,43 @@ Use --yes to apply the preview. Remote setup requires a finite validation comman
 Use --remove-env together with --yes-remove-env to delete a detected legacy .env
 after a successful validation.`,
 	Args: cobra.NoArgs,
-	RunE: func(_ *cobra.Command, _ []string) error {
+	RunE: func(command *cobra.Command, _ []string) error {
+		directory := "."
+		if setupPackageRoot != "" {
+			directory = setupPackageRoot
+		}
+		packageScripts := append([]string(nil), setupPackageScripts...)
+		if setupBinding != "" || len(setupCommand) > 0 {
+			if len(packageScripts) > 0 {
+				return fmt.Errorf("setup: package scripts and an explicit developer command cannot be selected together")
+			}
+			_, script, err := parsePackageScriptCommand(strings.Join(setupCommand, " "))
+			if err != nil {
+				return err
+			}
+			if setupBinding != "" && setupBinding != script {
+				return fmt.Errorf("setup: binding %q does not match package script %q", setupBinding, script)
+			}
+			packageScripts = []string{script}
+		}
 		request := setupworkflow.Request{
-			ProjectID:        setupProjectID,
-			Provider:         setupProvider,
-			Account:          setupAccount,
-			Vault:            setupVault,
-			ItemID:           setupItemID,
-			Item:             setupItem,
-			Binding:          setupBinding,
-			PackageScripts:   setupPackageScripts,
-			Command:          setupCommand,
-			Validate:         setupValidation,
-			Local:            setupLocal,
-			SelectedInputs:   setupSelectedInputs,
-			Store:            store.NewSystem(),
-			Confirm:          setupConfirm,
-			RemoveLegacyEnv:  setupRemoveLegacyEnv,
-			ConfirmRemoveEnv: setupConfirmRemoveEnv,
-			Output:           os.Stdout,
+			Directory:           directory,
+			PackageRootExplicit: command.Flags().Changed("package-root"),
+			ProjectID:           setupProjectID,
+			Provider:            setupProvider,
+			Account:             setupAccount,
+			Vault:               setupVault,
+			ItemID:              setupItemID,
+			Item:                setupItem,
+			PackageScripts:      packageScripts,
+			Validate:            setupValidation,
+			Local:               setupLocal,
+			SelectedInputs:      setupSelectedInputs,
+			Store:               store.NewSystem(),
+			Confirm:             setupConfirm,
+			RemoveLegacyEnv:     setupRemoveLegacyEnv,
+			ConfirmRemoveEnv:    setupConfirmRemoveEnv,
+			Output:              os.Stdout,
 		}
 		return runSetup(request, isTerminal(os.Stdin), isTerminal(os.Stdout), runInteractiveSetup, setupworkflow.Run)
 	},
@@ -77,6 +98,9 @@ func runSetup(request setupworkflow.Request, stdinTerminal, stdoutTerminal bool,
 }
 
 func runInteractiveSetup(request setupworkflow.Request) error {
+	if err := setupworkflow.ValidatePackageRoot(request.Directory, request.PackageRootExplicit); err != nil {
+		return err
+	}
 	return runGuidedSetup(request, setupworkflow.Discover, promptSetup, setupworkflow.Run)
 }
 
@@ -85,6 +109,7 @@ func isTerminal(file *os.File) bool {
 }
 
 func init() {
+	setupCmd.Flags().StringVar(&setupPackageRoot, "package-root", "", "package directory to configure")
 	setupCmd.Flags().StringVar(&setupProjectID, "project-id", "", "stable project identifier")
 	setupCmd.Flags().StringVar(&setupProvider, "provider", "", "secret provider (1password or bitwarden)")
 	setupCmd.Flags().StringVar(&setupAccount, "account", "", "1Password account")
