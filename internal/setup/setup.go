@@ -2,6 +2,7 @@
 package setup
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -23,6 +24,7 @@ import (
 )
 
 var ErrOnePasswordUnavailable = errors.New("1password unavailable")
+var ErrBitwardenUnavailable = errors.New("bitwarden unavailable")
 
 var tomlBareKey = regexp.MustCompile(`^[A-Za-z0-9_-]+$`)
 
@@ -48,6 +50,7 @@ type Request struct {
 	ConfirmRemoveEnv    bool
 	NonInteractive      bool
 	CheckOnePassword    func() error
+	CheckBitwarden      func() error
 	RunValidation       func([]string) error
 	ResolveConflict     func(Conflict) (ConflictResolution, error)
 	Store               store.Store
@@ -242,7 +245,14 @@ func Run(request Request) error {
 	if err != nil {
 		return err
 	}
-	setupPlan := buildPlan(request, inputs, candidates, configData)
+	changed, err := reconciliationChanged(request, existingConfig, config, configData, localProfiles, retainedScripts)
+	if err != nil {
+		return err
+	}
+	if request.RemoveLegacyEnv && hasPlaintextInput(inputs, ".env") {
+		changed = true
+	}
+	setupPlan := buildPlan(request, inputs, candidates, configData, existingConfig != nil, changed)
 	previewPlan(request.Output, setupPlan)
 	if !request.Confirm {
 		fmt.Fprintln(request.Output, "No changes made; rerun with explicit confirmation")
@@ -254,7 +264,17 @@ func Run(request Request) error {
 			return err
 		}
 	}
-	if !request.Local || request.RemoveLegacyEnv || len(request.Validate) > 0 {
+	if !request.Local && effectiveProvider(request) == "bitwarden" {
+		if err := checkBitwarden(request); err != nil {
+			fmt.Fprintln(request.Output, "Bitwarden is unavailable; run `bw login` and `bw unlock` before retrying")
+			return err
+		}
+	}
+	if !changed {
+		fmt.Fprintln(request.Output, "No changes detected; prerequisites verified")
+		return nil
+	}
+	if !request.Local || request.RemoveLegacyEnv || existingConfig != nil || len(request.Validate) > 0 {
 		if err := validateValidationCommand(request.Validate); err != nil {
 			return err
 		}
@@ -339,6 +359,63 @@ func Run(request Request) error {
 		fmt.Fprintln(request.Output, "Removed legacy .env")
 	}
 	return nil
+}
+
+func reconciliationChanged(request Request, existing *project.Config, config project.Config, configData []byte, localProfiles map[string]map[string]string, retainedScripts map[string]string) (bool, error) {
+	if existing == nil {
+		return true, nil
+	}
+	existingData, err := encodeConfig(*existing)
+	if err != nil {
+		return false, err
+	}
+	if !bytes.Equal(existingData, configData) {
+		return true, nil
+	}
+	if len(existing.ScriptBindings) > 0 || len(config.ScriptBindings) > 0 {
+		manifest, err := os.ReadFile(filepath.Join(request.Directory, "package.json"))
+		if err != nil {
+			return false, fmt.Errorf("setup: read package.json: %w", err)
+		}
+		updated, err := rewritePackageScripts(manifest, existing.ScriptBindings, config.ScriptBindings, retainedScripts)
+		if err != nil {
+			return false, err
+		}
+		if !bytes.Equal(manifest, updated) {
+			return true, nil
+		}
+	}
+	if !request.Local {
+		return false, nil
+	}
+	if request.Store == nil {
+		return false, fmt.Errorf("setup: local credential store is unavailable")
+	}
+	for _, profile := range sortedKeys(localProfiles) {
+		stored, err := request.Store.Get(request.ProjectID, profile)
+		if err != nil {
+			if errors.Is(err, store.ErrUnavailable) {
+				return true, nil
+			}
+			return false, fmt.Errorf("setup: compare local profile %q: %w", profile, err)
+		}
+		if !mapsEqual(stored, localProfiles[profile]) {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+func mapsEqual(left, right map[string]string) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for key, value := range left {
+		if right[key] != value {
+			return false
+		}
+	}
+	return true
 }
 
 func ValidatePackageRoot(directory string, explicit bool) error {
@@ -436,7 +513,7 @@ func selectSource(request *Request, plaintextInputExists bool) {
 	request.Local = true
 }
 
-func buildPlan(request Request, inputs []PlaintextInput, scripts []string, configData []byte) Plan {
+func buildPlan(request Request, inputs []PlaintextInput, scripts []string, configData []byte, existing, changed bool) Plan {
 	packageManager, _ := detectPackageManager(request.Directory)
 	plan := Plan{
 		ProjectID:         request.ProjectID,
@@ -447,6 +524,11 @@ func buildPlan(request Request, inputs []PlaintextInput, scripts []string, confi
 		FileChanges:       []string{"create inject.toml"},
 		ConfigData:        configData,
 	}
+	if !changed {
+		plan.FileChanges = nil
+	} else if existing {
+		plan.FileChanges[0] = "update inject.toml"
+	}
 	if request.Local {
 		plan.Source = "local"
 	}
@@ -456,10 +538,10 @@ func buildPlan(request Request, inputs []PlaintextInput, scripts []string, confi
 			plan.ValidationCandidates = append(plan.ValidationCandidates, name)
 		}
 	}
-	if request.RemoveLegacyEnv {
+	if changed && request.RemoveLegacyEnv {
 		plan.FileChanges = append(plan.FileChanges, "remove .env after successful validation")
 	}
-	if len(request.PackageScripts) > 0 {
+	if changed && len(request.PackageScripts) > 0 {
 		plan.FileChanges = append(plan.FileChanges, "modify package.json scripts")
 	}
 	return plan
@@ -505,8 +587,12 @@ func previewPlan(output io.Writer, plan Plan) {
 		fmt.Fprintf(output, "Selected validation: %s\n", command)
 	}
 	fmt.Fprintf(output, "Package manager: %s\n", plan.PackageManager)
-	for _, change := range plan.FileChanges {
-		fmt.Fprintf(output, "File change: %s\n", change)
+	if len(plan.FileChanges) == 0 {
+		fmt.Fprintln(output, "File changes: none")
+	} else {
+		for _, change := range plan.FileChanges {
+			fmt.Fprintf(output, "File change: %s\n", change)
+		}
 	}
 	fmt.Fprintln(output, "Will write inject.toml:")
 	fmt.Fprint(output, string(plan.ConfigData))
@@ -801,6 +887,27 @@ func checkOnePassword(request Request) error {
 	return nil
 }
 
+func checkBitwarden(request Request) error {
+	if request.CheckBitwarden != nil {
+		return request.CheckBitwarden()
+	}
+	path, err := exec.LookPath("bw")
+	if err != nil {
+		return ErrBitwardenUnavailable
+	}
+	output, err := exec.Command(path, "status").Output()
+	if err != nil {
+		return ErrBitwardenUnavailable
+	}
+	var status struct {
+		Status string `json:"status"`
+	}
+	if json.Unmarshal(output, &status) != nil || status.Status != "unlocked" {
+		return ErrBitwardenUnavailable
+	}
+	return nil
+}
+
 func plan(request Request, localProfiles map[string]map[string]string, existing *project.Config) (project.Config, error) {
 	profile := project.Profile{
 		Provider: effectiveProvider(request), Account: request.Account, Vault: request.Vault, ItemID: request.ItemID, Item: request.Item,
@@ -1006,9 +1113,12 @@ func resolveOwnedScriptConflicts(request Request, existing *project.Config, plan
 			return nil, err
 		}
 		if resolution == RetainConflict {
+			fmt.Fprintf(request.Output, "Conflict resolution: adopt current project entry %q\n", conflict.Script)
 			retained[conflict.Script] = conflict.current
 			adoptRetainedScript(planned, conflict)
+			continue
 		}
+		fmt.Fprintf(request.Output, "Conflict resolution: restore recorded inject-owned entry %q\n", conflict.Script)
 	}
 	return retained, nil
 }
