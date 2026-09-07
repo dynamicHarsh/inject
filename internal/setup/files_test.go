@@ -27,7 +27,7 @@ func TestApplyProjectFilesReportsCommitAndRollbackFailures(t *testing.T) {
 		writes++
 		switch writes {
 		case 1:
-			return writeFileAtomically(path, data, mode)
+			return WriteFileAtomically(path, data, mode)
 		case 2:
 			return commitErr
 		default:

@@ -315,7 +315,7 @@ func Run(request Request) error {
 			return fmt.Errorf("setup: validation failed: %w", err)
 		}
 	}
-	if err := applyProjectFiles(request.Directory, existingConfig, config, configData, retainedScripts, writeFileAtomically); err != nil {
+	if err := applyProjectFiles(request.Directory, existingConfig, config, configData, retainedScripts, WriteFileAtomically); err != nil {
 		if rollbackStore != nil {
 			if rollbackErr := rollbackStore(); rollbackErr != nil {
 				return errors.Join(err, rollbackErr)
@@ -1061,7 +1061,7 @@ func applyProjectFiles(directory string, existing *project.Config, config projec
 	return nil
 }
 
-func writeFileAtomically(path string, data []byte, mode os.FileMode) (err error) {
+func WriteFileAtomically(path string, data []byte, mode os.FileMode) (err error) {
 	temporary, err := os.CreateTemp(filepath.Dir(path), ".inject-setup-*")
 	if err != nil {
 		return err
@@ -1084,6 +1084,27 @@ func writeFileAtomically(path string, data []byte, mode os.FileMode) (err error)
 		return err
 	}
 	return os.Rename(temporaryPath, path)
+}
+
+func RestorePackageScripts(data []byte, bindings map[string]project.ScriptBinding) ([]byte, error) {
+	var manifest struct {
+		Scripts map[string]string `json:"scripts"`
+	}
+	if err := json.Unmarshal(data, &manifest); err != nil {
+		return nil, fmt.Errorf("setup: invalid package.json: %w", err)
+	}
+	var conflicts []Conflict
+	for _, name := range sortedKeys(bindings) {
+		conflicts = append(conflicts, ownedPackageScriptConflicts(name, bindings[name], manifest.Scripts)...)
+	}
+	if len(conflicts) > 0 {
+		names := make([]string, 0, len(conflicts))
+		for _, conflict := range conflicts {
+			names = append(names, strconv.Quote(conflict.Script))
+		}
+		return nil, fmt.Errorf("owned package scripts were modified: %s", strings.Join(names, ", "))
+	}
+	return rewritePackageScripts(data, bindings, nil, nil)
 }
 
 func rewritePackageScripts(data []byte, existing, bindings map[string]project.ScriptBinding, retained map[string]string) ([]byte, error) {
