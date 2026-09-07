@@ -186,7 +186,7 @@ func loadLocalProfileSecrets(config project.Config, profileName string, credenti
 	}
 	secrets, err := credentialStore.Get(config.ProjectID, profileName)
 	if err != nil {
-		return nil, fmt.Errorf("run: local secret set is unavailable")
+		return nil, fmt.Errorf("run: local secret set is unavailable; add an uncommitted .env and run `inject setup --local` to provision this machine")
 	}
 	return secrets, nil
 }
