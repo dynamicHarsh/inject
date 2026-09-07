@@ -101,6 +101,41 @@ func TestRunGuidedSetupDoesNotApplyCancelledChoices(t *testing.T) {
 	}
 }
 
+func TestParsePackageScriptCommand(t *testing.T) {
+	for _, test := range []struct {
+		command string
+		manager string
+		script  string
+		valid   bool
+	}{
+		{command: "npm run dev", manager: "npm", script: "dev", valid: true},
+		{command: "pnpm run serve", manager: "pnpm", script: "serve", valid: true},
+		{command: "pnpm dev", manager: "pnpm", script: "dev", valid: true},
+		{command: "yarn start", manager: "yarn", script: "start", valid: true},
+		{command: "yarn run start", manager: "yarn", script: "start", valid: true},
+		{command: "bun run dev", manager: "bun", script: "dev", valid: true},
+		{command: "go run ."},
+		{command: "dev"},
+		{command: "npm run dev | tee app.log"},
+		{command: "npm run dev > app.log"},
+		{command: "npm run dev && npm test"},
+		{command: "npm run dev -- --port 4000"},
+	} {
+		t.Run(test.command, func(t *testing.T) {
+			manager, script, err := parsePackageScriptCommand(test.command)
+			if !test.valid {
+				if err == nil {
+					t.Fatalf("parsePackageScriptCommand(%q) = %q, %q, nil; want error", test.command, manager, script)
+				}
+				return
+			}
+			if err != nil || manager != test.manager || script != test.script {
+				t.Errorf("parsePackageScriptCommand(%q) = %q, %q, %v; want %q, %q", test.command, manager, script, err, test.manager, test.script)
+			}
+		})
+	}
+}
+
 func TestPromptSetupDrivesDetectedChoicesWithoutTerminal(t *testing.T) {
 	discovery := setupworkflow.Discovery{
 		ProjectID:            "billing-api",
@@ -113,7 +148,7 @@ func TestPromptSetupDrivesDetectedChoicesWithoutTerminal(t *testing.T) {
 		PackageManager:       "npm",
 	}
 	var output bytes.Buffer
-	input := &responseReader{responses: []string{"billing-api", "1", "unused-account", "unused-vault", "unused-id", "", "unused-id", "", "0", "0", "2", "unused", "n", "y", "2"}}
+	input := &responseReader{responses: []string{"billing-api", "1", "unused-account", "unused-vault", "unused-id", "", "unused-id", "", "0", "npm run dev", "0", "2", "unused", "n", "y", "2"}}
 
 	request, err := promptSetupWithIO(discovery, setupworkflow.Request{Output: &output}, input, &output, true)
 	if err != nil {
@@ -135,10 +170,60 @@ func TestPromptSetupDrivesDetectedChoicesWithoutTerminal(t *testing.T) {
 	if resolution != setupworkflow.ReplaceConflict {
 		t.Errorf("resolution = %v, want explicit replacement", resolution)
 	}
-	for _, message := range []string{"Project ID", "Secret source", "Environment inputs and profiles", "Developer commands", "Finite validation command", "Review setup", "Applying setup..."} {
+	for _, message := range []string{"Project ID", "Secret source", "Environment inputs and profiles", "Primary developer command", "Finite validation command", "Review setup", "Applying setup..."} {
 		if !strings.Contains(output.String(), message) {
 			t.Errorf("output missing %q: %q", message, output.String())
 		}
+	}
+}
+
+func TestPromptSetupCollectsPrimaryCommandWhenDiscoveryIsInconclusive(t *testing.T) {
+	discovery := setupworkflow.Discovery{
+		ProjectID:         "billing-api",
+		DefaultSource:     "local",
+		PlaintextInputs:   []setupworkflow.PlaintextInput{{Name: ".env", Profile: "default", Selected: true}},
+		SelectedInputs:    []string{".env"},
+		DeveloperCommands: []setupworkflow.DeveloperCommand{{Name: "release"}},
+		PackageManager:    "pnpm",
+	}
+	var output bytes.Buffer
+	input := &responseReader{responses: []string{"billing-api", "1", "unused-account", "unused-vault", "unused-id", "", "unused-id", "", "0", "pnpm run release", "0", "1", "unused", "n", "y"}}
+
+	request, err := promptSetupWithIO(discovery, setupworkflow.Request{Output: &output}, input, &output, true)
+	if err != nil {
+		t.Fatalf("promptSetupWithIO() error = %v; output = %q", err, output.String())
+	}
+	if !reflect.DeepEqual(request.PackageScripts, []string{"release"}) {
+		t.Errorf("package scripts = %q, want collected primary release script", request.PackageScripts)
+	}
+}
+
+func TestRunGuidedSetupCancellationAtReviewDoesNotApplyWorkflow(t *testing.T) {
+	discovery := setupworkflow.Discovery{
+		ProjectID:            "billing-api",
+		DefaultSource:        "local",
+		PlaintextInputs:      []setupworkflow.PlaintextInput{{Name: ".env", Profile: "default", Selected: true}},
+		SelectedInputs:       []string{".env"},
+		DeveloperCommands:    []setupworkflow.DeveloperCommand{{Name: "dev", Default: true}},
+		SelectedCommands:     []string{"dev"},
+		ValidationCandidates: []string{"test"},
+		PackageManager:       "npm",
+	}
+	var output bytes.Buffer
+	input := &responseReader{responses: []string{"billing-api", "1", "unused-account", "unused-vault", "unused-id", "", "unused-id", "", "0", "npm run dev", "0", "2", "unused", "n", "n"}}
+	workflowCalled := false
+
+	err := runGuidedSetup(setupworkflow.Request{Output: &output},
+		func(string) (setupworkflow.Discovery, error) { return discovery, nil },
+		func(discovery setupworkflow.Discovery, request setupworkflow.Request) (setupworkflow.Request, error) {
+			return promptSetupWithIO(discovery, request, input, &output, true)
+		},
+		func(setupworkflow.Request) error { workflowCalled = true; return nil })
+	if err != nil {
+		t.Fatalf("runGuidedSetup() error = %v", err)
+	}
+	if workflowCalled {
+		t.Error("workflow ran after setup was cancelled at review")
 	}
 }
 

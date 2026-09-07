@@ -28,6 +28,7 @@ var tomlBareKey = regexp.MustCompile(`^[A-Za-z0-9_-]+$`)
 
 type Request struct {
 	Directory           string
+	PackageRootExplicit bool
 	ProjectID           string
 	Provider            string
 	Account             string
@@ -151,7 +152,7 @@ func Discover(directory string) (Discovery, error) {
 			if _, selected := existing.ScriptBindings[name]; selected {
 				discovery.SelectedCommands = append(discovery.SelectedCommands, name)
 			}
-		} else if command.Default {
+		} else if command.Default && len(discovery.SelectedCommands) == 0 {
 			discovery.SelectedCommands = append(discovery.SelectedCommands, name)
 		}
 		if isFiniteValidationScript(name) {
@@ -170,6 +171,9 @@ func detectedPackageManager(directory string) string {
 func Run(request Request) error {
 	if request.Directory == "" {
 		request.Directory = "."
+	}
+	if err := ValidatePackageRoot(request.Directory, request.PackageRootExplicit); err != nil {
+		return err
 	}
 	if request.Output == nil {
 		request.Output = io.Discard
@@ -333,6 +337,27 @@ func Run(request Request) error {
 			return fmt.Errorf("setup: remove legacy .env: %w", err)
 		}
 		fmt.Fprintln(request.Output, "Removed legacy .env")
+	}
+	return nil
+}
+
+func ValidatePackageRoot(directory string, explicit bool) error {
+	if explicit {
+		return nil
+	}
+	data, err := os.ReadFile(filepath.Join(directory, "package.json"))
+	if err != nil {
+		return nil
+	}
+	var manifest struct {
+		Workspaces json.RawMessage `json:"workspaces"`
+	}
+	if json.Unmarshal(data, &manifest) != nil {
+		return nil
+	}
+	workspaces := strings.TrimSpace(string(manifest.Workspaces))
+	if workspaces != "" && workspaces != "null" && workspaces != "[]" && workspaces != "{}" {
+		return fmt.Errorf("setup: package root is ambiguous; select one with --package-root")
 	}
 	return nil
 }
@@ -737,6 +762,9 @@ func validateRequest(request Request) error {
 	}
 	if request.Provider != "" && request.Local {
 		return fmt.Errorf("setup: provider and local source cannot be selected together")
+	}
+	if request.NonInteractive && len(request.PackageScripts) == 0 && request.PackageScript == "" {
+		return fmt.Errorf("setup: primary package-script binding is required outside an interactive terminal")
 	}
 	if request.Local {
 		return nil

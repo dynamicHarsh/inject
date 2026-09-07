@@ -575,6 +575,9 @@ func testSetupWritesConfirmedConfigurationAfterValidation(t *testing.T, provider
 	}
 
 	projectDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(projectDir, "package.json"), []byte(`{"packageManager":"npm@10.0.0","scripts":{"dev":"vite","test":"go test ./..."}}`), 0o600); err != nil {
+		t.Fatalf("write package.json: %v", err)
+	}
 	opPath := filepath.Join(projectDir, "op")
 	op := "#!/bin/sh\nif [ \"$1\" = account ]; then exit 0; fi\nprintf '%s\\n' '{\"fields\":[{\"id\":\"notesPlain\",\"value\":\"TOKEN=from-note\\n\"}]}'\n"
 	if err := os.WriteFile(opPath, []byte(op), 0o700); err != nil {
@@ -584,6 +587,7 @@ func testSetupWritesConfirmedConfigurationAfterValidation(t *testing.T, provider
 	args := append([]string{"setup"}, providerArgs...)
 	args = append(args,
 		"--project-id", "billing-api", "--account", "acme", "--vault", "Engineering", "--item-id", "stable-note-id", "--yes",
+		"--package-script", "dev,test",
 		"--validate=sh", "--validate=-c", "--validate=exit 0",
 	)
 	command := exec.Command(binaryPath, args...)
@@ -602,5 +606,13 @@ func testSetupWritesConfirmedConfigurationAfterValidation(t *testing.T, provider
 	}
 	if strings.Contains(string(config), "TOKEN=") || !strings.Contains(string(config), "item_id = \"stable-note-id\"") {
 		t.Errorf("inject.toml = %q, want non-secret remote reference", config)
+	}
+	for _, binding := range []string{"[script_bindings.dev]", "[script_bindings.test]"} {
+		if !strings.Contains(string(config), binding) {
+			t.Errorf("inject.toml = %q, want %s", config, binding)
+		}
+	}
+	if count := strings.Count(string(config), `profile = "default"`); count != 2 {
+		t.Errorf("inject.toml has %d default-profile script bindings, want 2", count)
 	}
 }
