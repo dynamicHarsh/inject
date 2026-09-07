@@ -360,6 +360,9 @@ func TestRunAppliesBitwardenSourceWithValidation(t *testing.T) {
 		ItemID:    "note-id",
 		Confirm:   true,
 		Validate:  []string{"go", "test", "./..."},
+		CheckBitwarden: func() error {
+			return nil
+		},
 		RunValidation: func(command []string) error {
 			validationRan = reflect.DeepEqual(command, []string{"go", "test", "./..."})
 			return nil
@@ -907,12 +910,191 @@ func TestRunUnchangedRerunIsIdempotent(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	prerequisiteChecked := false
+	request.CheckOnePassword = func() error {
+		prerequisiteChecked = true
+		return nil
+	}
+	request.RunValidation = func([]string) error {
+		t.Fatal("RunValidation() ran for an unchanged reconciliation")
+		return nil
+	}
 	if err := setup.Run(request); err != nil {
 		t.Fatalf("rerun Run() error = %v", err)
+	}
+	if !prerequisiteChecked {
+		t.Error("1Password prerequisite was not checked")
 	}
 	if got, err := os.ReadFile(path); err != nil || !bytes.Equal(got, contents) {
 		t.Errorf("inject.toml = %q, %v; want unchanged %q", got, err, contents)
 	}
+}
+
+func TestRunUnchangedBitwardenRerunChecksPrerequisitesWithoutValidation(t *testing.T) {
+	directory := t.TempDir()
+	request := setup.Request{
+		Directory: directory,
+		ProjectID: "billing-api",
+		Provider:  "bitwarden",
+		ItemID:    "note-id",
+		Validate:  []string{"go", "test", "./..."},
+		Confirm:   true,
+		Output:    io.Discard,
+		CheckBitwarden: func() error {
+			return nil
+		},
+		RunValidation: func([]string) error { return nil },
+	}
+	if err := setup.Run(request); err != nil {
+		t.Fatalf("first Run() error = %v", err)
+	}
+
+	prerequisiteChecked := false
+	request.CheckBitwarden = func() error {
+		prerequisiteChecked = true
+		return nil
+	}
+	request.RunValidation = func([]string) error {
+		t.Fatal("RunValidation() ran for an unchanged reconciliation")
+		return nil
+	}
+	if err := setup.Run(request); err != nil {
+		t.Fatalf("rerun Run() error = %v", err)
+	}
+	if !prerequisiteChecked {
+		t.Error("Bitwarden prerequisite was not checked")
+	}
+}
+
+func TestRunUnchangedLocalRerunPreservesCredentialStoreWithoutValidation(t *testing.T) {
+	directory := t.TempDir()
+	if err := os.WriteFile(filepath.Join(directory, ".env"), []byte("TOKEN=local-value\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	credentialStore := &countingStore{Store: store.NewMemory()}
+	request := setup.Request{Directory: directory, ProjectID: "billing-api", Local: true, SelectedInputs: []string{".env"}, Confirm: true, Store: credentialStore, Output: io.Discard}
+	if err := setup.Run(request); err != nil {
+		t.Fatalf("first Run() error = %v", err)
+	}
+	credentialStore.writes = 0
+	request.RunValidation = func([]string) error {
+		t.Fatal("RunValidation() ran for an unchanged reconciliation")
+		return nil
+	}
+
+	if err := setup.Run(request); err != nil {
+		t.Fatalf("rerun Run() error = %v", err)
+	}
+	if credentialStore.writes != 0 {
+		t.Errorf("credential-store mutations = %d, want none", credentialStore.writes)
+	}
+}
+
+func TestRunMeaningfulReconciliationChangesRequireValidation(t *testing.T) {
+	t.Run("source", func(t *testing.T) {
+		directory := t.TempDir()
+		initial := request(directory, io.Discard)
+		initial.Confirm = true
+		initial.RunValidation = func([]string) error { return nil }
+		if err := setup.Run(initial); err != nil {
+			t.Fatalf("first Run() error = %v", err)
+		}
+
+		changed := initial
+		changed.Provider = "bitwarden"
+		changed.Account = ""
+		changed.Vault = ""
+		changed.CheckBitwarden = func() error { return nil }
+		changed.RunValidation = func([]string) error { return errors.New("validation sentinel") }
+		if err := setup.Run(changed); err == nil || !strings.Contains(err.Error(), "validation sentinel") {
+			t.Fatalf("changed source Run() error = %v, want validation failure", err)
+		}
+	})
+
+	t.Run("binding", func(t *testing.T) {
+		directory := t.TempDir()
+		for name, contents := range map[string]string{
+			"package.json":      `{"scripts":{"dev":"vite","serve":"http-server"}}`,
+			"package-lock.json": "",
+		} {
+			if err := os.WriteFile(filepath.Join(directory, name), []byte(contents), 0o600); err != nil {
+				t.Fatal(err)
+			}
+		}
+		initial := request(directory, io.Discard)
+		initial.PackageScripts = []string{"dev"}
+		initial.Confirm = true
+		initial.RunValidation = func([]string) error { return nil }
+		if err := setup.Run(initial); err != nil {
+			t.Fatalf("first Run() error = %v", err)
+		}
+
+		changed := initial
+		changed.PackageScripts = []string{"dev", "serve"}
+		changed.RunValidation = func([]string) error { return errors.New("validation sentinel") }
+		if err := setup.Run(changed); err == nil || !strings.Contains(err.Error(), "validation sentinel") {
+			t.Fatalf("changed binding Run() error = %v, want validation failure", err)
+		}
+	})
+
+	t.Run("profile", func(t *testing.T) {
+		directory := t.TempDir()
+		if err := os.WriteFile(filepath.Join(directory, ".env"), []byte("TOKEN=default\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		credentialStore := store.NewMemory()
+		initial := setup.Request{Directory: directory, ProjectID: "billing-api", Local: true, SelectedInputs: []string{".env"}, Confirm: true, Store: credentialStore, Output: io.Discard}
+		if err := setup.Run(initial); err != nil {
+			t.Fatalf("first Run() error = %v", err)
+		}
+		if err := os.WriteFile(filepath.Join(directory, ".env.staging"), []byte("TOKEN=staging\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+
+		changed := initial
+		changed.SelectedInputs = []string{".env", ".env.staging"}
+		if err := setup.Run(changed); err == nil || err.Error() != "setup: a finite validation command is required" {
+			t.Fatalf("changed profile Run() error = %v, want finite validation requirement", err)
+		}
+		if _, err := credentialStore.Get("billing-api", "staging"); !errors.Is(err, store.ErrUnavailable) {
+			t.Errorf("staging profile Get() error = %v, want no mutation", err)
+		}
+	})
+
+	t.Run("local secret set", func(t *testing.T) {
+		directory := t.TempDir()
+		envPath := filepath.Join(directory, ".env")
+		if err := os.WriteFile(envPath, []byte("TOKEN=first\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		credentialStore := store.NewMemory()
+		initial := setup.Request{Directory: directory, ProjectID: "billing-api", Local: true, SelectedInputs: []string{".env"}, Confirm: true, Store: credentialStore, Output: io.Discard}
+		if err := setup.Run(initial); err != nil {
+			t.Fatalf("first Run() error = %v", err)
+		}
+		if err := os.WriteFile(envPath, []byte("TOKEN=second\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+
+		changed := initial
+		if err := setup.Run(changed); err == nil || err.Error() != "setup: a finite validation command is required" {
+			t.Fatalf("changed local secret Run() error = %v, want finite validation requirement", err)
+		}
+		secrets, err := credentialStore.Get("billing-api", "default")
+		if err != nil || secrets["TOKEN"] != "first" {
+			t.Errorf("stored secrets = %q, %v; want prior secret set", secrets, err)
+		}
+
+		changed.Validate = []string{"go", "test", "./..."}
+		changed.RunValidation = func([]string) error { return errors.New("validation sentinel") }
+		if err := setup.Run(changed); err == nil || !strings.Contains(err.Error(), "validation sentinel") {
+			t.Fatalf("changed local secret Run() error = %v, want validation failure", err)
+		}
+		secrets, err = credentialStore.Get("billing-api", "default")
+		if err != nil || secrets["TOKEN"] != "first" {
+			t.Errorf("stored secrets = %q, %v; want prior secret set", secrets, err)
+		}
+	})
 }
 
 func TestRunRejectsNonFiniteValidationBeforeWritingConfiguration(t *testing.T) {
@@ -1172,7 +1354,8 @@ func TestRunAppliesMixedOwnedScriptConflictChoices(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(directory, "package-lock.json"), nil, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	request := request(directory, io.Discard)
+	var output bytes.Buffer
+	request := request(directory, &output)
 	request.PackageScripts = []string{"dev"}
 	request.Confirm = true
 	request.RunValidation = func([]string) error { return nil }
@@ -1191,6 +1374,14 @@ func TestRunAppliesMixedOwnedScriptConflictChoices(t *testing.T) {
 	}
 	if err := setup.Run(request); err != nil {
 		t.Fatalf("rerun Run() error = %v", err)
+	}
+	for _, want := range []string{
+		`Conflict resolution: adopt current project entry "dev"`,
+		`Conflict resolution: restore recorded inject-owned entry "inject:original:predev"`,
+	} {
+		if !strings.Contains(output.String(), want) {
+			t.Errorf("output = %q, want %q", output.String(), want)
+		}
 	}
 	scripts := readManifestScripts(t, packagePath)
 	if scripts["dev"] != "manual wrapper" || scripts["inject:original:predev"] != "prepare" {
@@ -1221,6 +1412,8 @@ func TestRunAddsAndRemovesProfilesAndPackageScripts(t *testing.T) {
 	if err := setup.Run(request); err != nil {
 		t.Fatalf("first Run() error = %v", err)
 	}
+	request.Validate = []string{"go", "test", "./..."}
+	request.RunValidation = func([]string) error { return nil }
 	if err := os.WriteFile(filepath.Join(directory, ".env.staging"), []byte("TOKEN=staging-secret\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -1620,6 +1813,21 @@ func (store *failingPutStore) Put(projectID, profile string, secrets map[string]
 		return fmt.Errorf("store unavailable")
 	}
 	return store.Store.Put(projectID, profile, secrets)
+}
+
+type countingStore struct {
+	store.Store
+	writes int
+}
+
+func (store *countingStore) Put(projectID, profile string, secrets map[string]string) error {
+	store.writes++
+	return store.Store.Put(projectID, profile, secrets)
+}
+
+func (store *countingStore) Delete(projectID, profile string) error {
+	store.writes++
+	return store.Store.Delete(projectID, profile)
 }
 
 type rollbackFailingStore struct {
