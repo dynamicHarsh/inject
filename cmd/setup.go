@@ -1,12 +1,10 @@
 package cmd
 
 import (
-	"bufio"
-	"fmt"
 	"io"
 	"os"
-	"strings"
 
+	"github.com/charmbracelet/x/term"
 	"github.com/spf13/cobra"
 
 	setupworkflow "github.com/harsh-sonkar/env-pull/internal/setup"
@@ -14,6 +12,7 @@ import (
 )
 
 var (
+	setupInput            io.Reader = os.Stdin
 	setupProjectID        string
 	setupProvider         string
 	setupAccount          string
@@ -46,66 +45,43 @@ Use --remove-env together with --yes-remove-env to delete a detected legacy .env
 after a successful validation.`,
 	Args: cobra.NoArgs,
 	RunE: func(_ *cobra.Command, _ []string) error {
-		interactive := isTerminal(os.Stdin) && isTerminal(os.Stdout)
-		var scriptSelector func([]string, string) (string, error)
-		if interactive {
-			scriptSelector = selectPackageScript
+		request := setupworkflow.Request{
+			ProjectID:        setupProjectID,
+			Provider:         setupProvider,
+			Account:          setupAccount,
+			Vault:            setupVault,
+			ItemID:           setupItemID,
+			Item:             setupItem,
+			Binding:          setupBinding,
+			PackageScripts:   setupPackageScripts,
+			Command:          setupCommand,
+			Validate:         setupValidation,
+			Local:            setupLocal,
+			SelectedInputs:   setupSelectedInputs,
+			Store:            store.NewSystem(),
+			Confirm:          setupConfirm,
+			RemoveLegacyEnv:  setupRemoveLegacyEnv,
+			ConfirmRemoveEnv: setupConfirmRemoveEnv,
+			Output:           os.Stdout,
 		}
-		return setupworkflow.Run(setupworkflow.Request{
-			ProjectID:           setupProjectID,
-			Provider:            setupProvider,
-			Account:             setupAccount,
-			Vault:               setupVault,
-			ItemID:              setupItemID,
-			Item:                setupItem,
-			Binding:             setupBinding,
-			PackageScripts:      setupPackageScripts,
-			SelectPackageScript: scriptSelector,
-			Command:             setupCommand,
-			Validate:            setupValidation,
-			Local:               setupLocal,
-			SelectedInputs:      setupSelectedInputs,
-			Store:               store.NewSystem(),
-			Confirm:             setupConfirm,
-			RemoveLegacyEnv:     setupRemoveLegacyEnv,
-			ConfirmRemoveEnv:    setupConfirmRemoveEnv,
-			NonInteractive:      !interactive,
-			Output:              os.Stdout,
-		})
+		return runSetup(request, isTerminal(os.Stdin), isTerminal(os.Stdout), runInteractiveSetup, setupworkflow.Run)
 	},
 }
 
-func isTerminal(file *os.File) bool {
-	info, err := file.Stat()
-	return err == nil && info.Mode()&os.ModeCharDevice != 0
+func runSetup(request setupworkflow.Request, stdinTerminal, stdoutTerminal bool, interactive, deterministic func(setupworkflow.Request) error) error {
+	if stdinTerminal && stdoutTerminal {
+		return interactive(request)
+	}
+	request.NonInteractive = true
+	return deterministic(request)
 }
 
-func selectPackageScript(candidates []string, defaultScript string) (string, error) {
-	if len(candidates) == 0 {
-		return "", nil
-	}
-	if defaultScript == "" {
-		fmt.Fprint(os.Stdout, "Select a package script (or none): ")
-	} else {
-		fmt.Fprintf(os.Stdout, "Select a package script [%s] (or none): ", defaultScript)
-	}
-	selection, err := bufio.NewReader(os.Stdin).ReadString('\n')
-	if err != nil && err != io.EOF {
-		return "", fmt.Errorf("setup: read package script selection: %w", err)
-	}
-	selection = strings.TrimSpace(selection)
-	if selection == "" {
-		return defaultScript, nil
-	}
-	if selection == "none" {
-		return "", nil
-	}
-	for _, candidate := range candidates {
-		if selection == candidate {
-			return selection, nil
-		}
-	}
-	return "", fmt.Errorf("setup: package script %q is not available", selection)
+func runInteractiveSetup(request setupworkflow.Request) error {
+	return runGuidedSetup(request, setupworkflow.Discover, promptSetup, setupworkflow.Run)
+}
+
+func isTerminal(file *os.File) bool {
+	return term.IsTerminal(file.Fd())
 }
 
 func init() {
