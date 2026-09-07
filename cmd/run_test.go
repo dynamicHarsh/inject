@@ -35,6 +35,15 @@ func TestLoadLocalProfileSecretsUsesProjectAndProfileScope(t *testing.T) {
 	}
 }
 
+func TestLoadLocalProfileSecretsGuidesCloneProvisioning(t *testing.T) {
+	config := project.Config{ProjectID: "billing-api"}
+
+	_, err := loadLocalProfileSecrets(config, "default", store.NewMemory())
+	if err == nil || !strings.Contains(err.Error(), "add an uncommitted .env and run `inject setup --local`") {
+		t.Fatalf("loadLocalProfileSecrets() error = %v, want local setup guidance", err)
+	}
+}
+
 func TestLoadRemoteProfileSecretsRefreshesOptInCacheForOfflineUse(t *testing.T) {
 	credentialStore := store.NewMemory()
 	now := time.Date(2026, time.September, 5, 12, 0, 0, 0, time.UTC)

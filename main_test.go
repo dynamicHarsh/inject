@@ -177,7 +177,7 @@ item_id = "stable-note-id"
 	}
 }
 
-func TestConfiguredPackageScriptRunsLifecycleInsideInjectedProcessTree(t *testing.T) {
+func TestFreshCloneRunsCommittedPackageScriptWithoutSetup(t *testing.T) {
 	npmPath, err := exec.LookPath("npm")
 	if err != nil {
 		t.Skip("npm is not installed")

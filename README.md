@@ -42,8 +42,19 @@ The binary is written to `./bin/inject`.
 
 ## Quick Start
 
-Install `inject` before configuring a project. For a remote source, also install
-the provider CLI and sign in with your existing provider account.
+After a project commits its inject configuration and bindings, developers keep
+using its ordinary command:
+
+```bash
+npm run dev
+pnpm run dev
+yarn dev
+bun run dev
+```
+
+The `inject` executable must be on `PATH`. For a remote source, the matching
+provider CLI (`op` or `bw`) must also be on `PATH` and authenticated with the
+developer's existing provider account.
 
 ### Team Project: 1Password
 
@@ -70,8 +81,8 @@ inject setup \
 ```
 
 Commit the generated `inject.toml` and `package.json` changes. Each developer
-signs in to `op` using their own account, then uses the same project-native
-command they used before setup:
+who clones the project installs `inject` and the 1Password CLI, runs `op signin`,
+then uses the same project-native command without rerunning setup:
 
 ```bash
 npm run dev
@@ -80,7 +91,10 @@ npm run dev
 Setup preserves the selected script and its `pre` and `post` lifecycle hooks
 behind an injected wrapper. The equivalent unchanged commands are `pnpm run dev`,
 `yarn dev`, and `bun run dev` when the project declares that package manager.
-Only scripts declared by Node projects in `package.json` can be wrapped this way.
+Only scripts declared in `package.json` are currently supported binding surfaces.
+Direct commands such as `go run .`, `python app.py`, and `cargo run` cannot keep
+their unchanged invocation because inject does not alter shells, shadow
+executables, or modify application source.
 
 For a command that is not declared in `package.json`, use the explicit fallback:
 
@@ -105,6 +119,13 @@ requested with both `--remove-env` and `--yes-remove-env`. Use `--local` to forc
 local source selection when needed. Run `inject edit` to add, rename, update, or
 delete values in a local secret set; changes remain in memory until you confirm
 them. Remote secret sets must be edited in their owning provider.
+
+A teammate cloning a project whose committed profile uses `provider = "local"`
+must obtain the values separately, place them in an uncommitted `.env`, and run
+`inject setup --local --package-script dev --yes` to provision their own
+credential store. Until then, the unchanged project command fails closed with
+setup guidance. Secret values are never read from `inject.toml` or other
+committed project state.
 
 ### One-off command
 
@@ -191,7 +212,7 @@ inject export               # legacy encrypted-vault export
 - `setup` previews and, with `--yes`, creates or updates project configuration and selected `package.json` script bindings. Use `--validate` repeatedly to supply a finite validation command. A rerun is idempotent when generated scripts are unchanged; if an inject-owned script was modified, interactive setup asks whether to retain or replace it, while non-interactive setup stops before mutation.
 - `<binding>` runs an explicit named command declared under `[commands.<name>]` in `inject.toml` as an injected foreground child process.
 - `run` injects a selected profile into an undeclared child command. Place all `inject` flags before the child command.
-- `remove` first previews the project configuration, package scripts, local secret sets, and remote caches it will remove. `--yes` confirms restoration of original scripts and deletion of only that project's local state. It never deletes remote provider items.
+- `remove` first previews the project configuration, exact package-script and lifecycle restoration, local secret sets, and remote caches without printing secret values. `--yes` restores unchanged owned entries, deletes their reserved entries, and deletes only that project's local state. Any ownership conflict stops before mutation, and write or credential-store failures roll back prior removal changes. Remote provider items are never edited or deleted.
 - `edit` changes configured local secret sets without a plaintext temporary file. Remote secret sets remain provider-owned. Without `inject.toml`, it retains compatibility with the legacy encrypted-vault editor.
 - `export` remains for compatibility with the former encrypted `.env.pull.enc` workflow. New projects should use `setup` instead.
 
