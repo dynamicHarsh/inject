@@ -151,8 +151,32 @@ func promptSetupWithIO(discovery setupworkflow.Discovery, request setupworkflow.
 	request.RemoveLegacyEnv = removePlaintext
 	request.ConfirmRemoveEnv = removePlaintext
 	request.NonInteractive = false
+	request.ResolveConflict = func(conflict setupworkflow.Conflict) (setupworkflow.ConflictResolution, error) {
+		return promptSetupConflict(conflict, input, output, accessible)
+	}
 	fmt.Fprintln(output, "Applying setup...")
 	return request, nil
+}
+
+func promptSetupConflict(conflict setupworkflow.Conflict, input io.Reader, output io.Writer, accessible bool) (setupworkflow.ConflictResolution, error) {
+	resolution := setupworkflow.RetainConflict
+	form := huh.NewForm(huh.NewGroup(
+		huh.NewSelect[setupworkflow.ConflictResolution]().
+			Title(fmt.Sprintf("Owned package script %q was changed", conflict.Script)).
+			Description("Retain the current entry or explicitly restore inject's recorded value").
+			Options(
+				huh.NewOption("Retain current entry", setupworkflow.RetainConflict),
+				huh.NewOption("Replace with recorded value", setupworkflow.ReplaceConflict),
+			).
+			Value(&resolution),
+	)).WithInput(input).WithOutput(output).WithAccessible(accessible)
+	if err := form.Run(); err != nil {
+		if errors.Is(err, huh.ErrUserAborted) {
+			return setupworkflow.RetainConflict, errSetupCancelled
+		}
+		return setupworkflow.RetainConflict, fmt.Errorf("setup: resolve package script conflict: %w", err)
+	}
+	return resolution, nil
 }
 
 func nonEmpty(name string) func(string) error {

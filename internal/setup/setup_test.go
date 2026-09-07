@@ -13,6 +13,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/harsh-sonkar/env-pull/internal/project"
 	"github.com/harsh-sonkar/env-pull/internal/setup"
 	"github.com/harsh-sonkar/env-pull/internal/store"
 )
@@ -190,6 +191,43 @@ func TestDiscoverReturnsInteractiveDefaultsWithoutSecretValues(t *testing.T) {
 	}
 	if strings.Contains(fmt.Sprintf("%#v", discovery), "private-value") {
 		t.Error("discovery leaked a secret value")
+	}
+}
+
+func TestDiscoverLoadsExistingSetupSelections(t *testing.T) {
+	directory := t.TempDir()
+	for name, contents := range map[string]string{
+		".env":              "TOKEN=private-value\n",
+		".env.staging":      "TOKEN=staging-value\n",
+		"package-lock.json": "",
+		"package.json":      `{"scripts":{"dev":"vite","test":"go test ./..."}}`,
+	} {
+		if err := os.WriteFile(filepath.Join(directory, name), []byte(contents), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	request := setup.Request{Directory: directory, ProjectID: "billing-api", Local: true, SelectedInputs: []string{".env", ".env.staging"}, PackageScripts: []string{"dev"}, Confirm: true, Store: store.NewMemory(), Output: io.Discard}
+	if err := setup.Run(request); err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+
+	discovery, err := setup.Discover(directory)
+	if err != nil {
+		t.Fatalf("Discover() error = %v", err)
+	}
+	if discovery.ProjectID != "billing-api" || discovery.DefaultSource != "local" {
+		t.Errorf("Discover() = %#v, want existing project and local source", discovery)
+	}
+	if !reflect.DeepEqual(discovery.SelectedInputs, []string{".env", ".env.staging"}) {
+		t.Errorf("selected inputs = %q, want existing profiles", discovery.SelectedInputs)
+	}
+	if !reflect.DeepEqual(discovery.SelectedCommands, []string{"dev"}) {
+		t.Errorf("selected commands = %q, want existing owned command", discovery.SelectedCommands)
+	}
+	for _, command := range discovery.DeveloperCommands {
+		if strings.HasPrefix(command.Name, "inject:original:") {
+			t.Errorf("generated command %q was offered for selection", command.Name)
+		}
 	}
 }
 
@@ -856,21 +894,24 @@ func TestRunRestoresCredentialStoreAndProjectFilesWhenFileCommitFails(t *testing
 	}
 }
 
-func TestRunDoesNotOverwriteExistingConfiguration(t *testing.T) {
+func TestRunUnchangedRerunIsIdempotent(t *testing.T) {
 	directory := t.TempDir()
 	path := filepath.Join(directory, "inject.toml")
-	contents := []byte("existing configuration\n")
-	if err := os.WriteFile(path, contents, 0o600); err != nil {
-		t.Fatal(err)
-	}
 	request := request(directory, io.Discard)
 	request.Confirm = true
 	request.RunValidation = func([]string) error { return nil }
-	if err := setup.Run(request); err == nil {
-		t.Fatal("Run() error = nil, want existing configuration rejected")
+	if err := setup.Run(request); err != nil {
+		t.Fatalf("first Run() error = %v", err)
+	}
+	contents, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := setup.Run(request); err != nil {
+		t.Fatalf("rerun Run() error = %v", err)
 	}
 	if got, err := os.ReadFile(path); err != nil || !bytes.Equal(got, contents) {
-		t.Errorf("inject.toml = %q, %v; want unchanged", got, err)
+		t.Errorf("inject.toml = %q, %v; want unchanged %q", got, err, contents)
 	}
 }
 
@@ -972,6 +1013,291 @@ func TestRunPreservesPackageScriptAndLifecycleHooksBehindInjectWrapper(t *testin
 		if !bytes.Contains(config, []byte(want)) {
 			t.Errorf("inject.toml = %q, want %q", config, want)
 		}
+	}
+}
+
+func TestRunUnchangedPackageScriptRerunIsIdempotent(t *testing.T) {
+	directory := t.TempDir()
+	packagePath := filepath.Join(directory, "package.json")
+	if err := os.WriteFile(packagePath, []byte(`{"scripts":{"predev":"prepare","dev":"vite","postdev":"cleanup"}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(directory, "package-lock.json"), nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	request := request(directory, io.Discard)
+	request.PackageScripts = []string{"dev"}
+	request.Confirm = true
+	request.RunValidation = func([]string) error { return nil }
+	if err := setup.Run(request); err != nil {
+		t.Fatalf("first Run() error = %v", err)
+	}
+	configBefore, err := os.ReadFile(filepath.Join(directory, "inject.toml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifestBefore, err := os.ReadFile(packagePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := setup.Run(request); err != nil {
+		t.Fatalf("rerun Run() error = %v", err)
+	}
+	if got, err := os.ReadFile(filepath.Join(directory, "inject.toml")); err != nil || !bytes.Equal(got, configBefore) {
+		t.Errorf("inject.toml = %q, %v; want unchanged", got, err)
+	}
+	if got, err := os.ReadFile(packagePath); err != nil || !bytes.Equal(got, manifestBefore) {
+		t.Errorf("package.json = %q, %v; want unchanged", got, err)
+	}
+}
+
+func TestRunNonInteractiveReportsAllOwnedScriptConflictsWithoutMutation(t *testing.T) {
+	directory := t.TempDir()
+	packagePath := filepath.Join(directory, "package.json")
+	if err := os.WriteFile(packagePath, []byte(`{"scripts":{"predev":"prepare","dev":"vite"}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(directory, "package-lock.json"), nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	request := request(directory, io.Discard)
+	request.PackageScripts = []string{"dev"}
+	request.Confirm = true
+	request.RunValidation = func([]string) error { return nil }
+	if err := setup.Run(request); err != nil {
+		t.Fatalf("first Run() error = %v", err)
+	}
+	configBefore, err := os.ReadFile(filepath.Join(directory, "inject.toml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifest := readManifestScripts(t, packagePath)
+	manifest["dev"] = "manually changed wrapper"
+	manifest["inject:original:predev"] = "manually changed hook"
+	writeManifestScripts(t, packagePath, manifest)
+	manifestBefore, err := os.ReadFile(packagePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.NonInteractive = true
+	request.RunValidation = func([]string) error {
+		t.Fatal("validation ran despite owned-script conflicts")
+		return nil
+	}
+
+	err = setup.Run(request)
+	if err == nil || !strings.Contains(err.Error(), `"dev"`) || !strings.Contains(err.Error(), `"inject:original:predev"`) {
+		t.Fatalf("Run() error = %v, want every owned-script conflict", err)
+	}
+	if got, err := os.ReadFile(filepath.Join(directory, "inject.toml")); err != nil || !bytes.Equal(got, configBefore) {
+		t.Errorf("inject.toml = %q, %v; want unchanged", got, err)
+	}
+	if got, err := os.ReadFile(packagePath); err != nil || !bytes.Equal(got, manifestBefore) {
+		t.Errorf("package.json = %q, %v; want unchanged", got, err)
+	}
+}
+
+func TestRunResolvesOwnedScriptConflictExplicitly(t *testing.T) {
+	for _, test := range []struct {
+		name       string
+		resolution setup.ConflictResolution
+		refuse     bool
+		wantScript string
+	}{
+		{name: "replace", resolution: setup.ReplaceConflict, wantScript: `inject __run-package-script "dev"`},
+		{name: "retain", resolution: setup.RetainConflict, wantScript: "manual command"},
+		{name: "refuse", refuse: true, wantScript: "manual command"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			directory := t.TempDir()
+			packagePath := filepath.Join(directory, "package.json")
+			if err := os.WriteFile(packagePath, []byte(`{"scripts":{"dev":"vite"}}`), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(directory, "package-lock.json"), nil, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			request := request(directory, io.Discard)
+			request.PackageScripts = []string{"dev"}
+			request.Confirm = true
+			request.RunValidation = func([]string) error { return nil }
+			if err := setup.Run(request); err != nil {
+				t.Fatalf("first Run() error = %v", err)
+			}
+			manifest := readManifestScripts(t, packagePath)
+			manifest["dev"] = "manual command"
+			writeManifestScripts(t, packagePath, manifest)
+			manifestBefore, _ := os.ReadFile(packagePath)
+			configBefore, _ := os.ReadFile(filepath.Join(directory, "inject.toml"))
+			request.ResolveConflict = func(conflict setup.Conflict) (setup.ConflictResolution, error) {
+				if conflict.Script != "dev" {
+					t.Errorf("conflict = %#v, want dev", conflict)
+				}
+				if test.refuse {
+					return setup.RetainConflict, errors.New("setup cancelled")
+				}
+				return test.resolution, nil
+			}
+
+			err := setup.Run(request)
+			if test.refuse {
+				if err == nil || err.Error() != "setup cancelled" {
+					t.Fatalf("Run() error = %v, want cancellation", err)
+				}
+				if got, _ := os.ReadFile(packagePath); !bytes.Equal(got, manifestBefore) {
+					t.Errorf("package.json changed after refusal: %q", got)
+				}
+				if got, _ := os.ReadFile(filepath.Join(directory, "inject.toml")); !bytes.Equal(got, configBefore) {
+					t.Errorf("inject.toml changed after refusal: %q", got)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("Run() error = %v", err)
+			}
+			if got := readManifestScripts(t, packagePath)["dev"]; got != test.wantScript {
+				t.Errorf("dev script = %q, want %q", got, test.wantScript)
+			}
+		})
+	}
+}
+
+func TestRunAppliesMixedOwnedScriptConflictChoices(t *testing.T) {
+	directory := t.TempDir()
+	packagePath := filepath.Join(directory, "package.json")
+	if err := os.WriteFile(packagePath, []byte(`{"scripts":{"predev":"prepare","dev":"vite"}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(directory, "package-lock.json"), nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	request := request(directory, io.Discard)
+	request.PackageScripts = []string{"dev"}
+	request.Confirm = true
+	request.RunValidation = func([]string) error { return nil }
+	if err := setup.Run(request); err != nil {
+		t.Fatalf("first Run() error = %v", err)
+	}
+	manifest := readManifestScripts(t, packagePath)
+	manifest["dev"] = "manual wrapper"
+	manifest["inject:original:predev"] = "manual hook"
+	writeManifestScripts(t, packagePath, manifest)
+	request.ResolveConflict = func(conflict setup.Conflict) (setup.ConflictResolution, error) {
+		if conflict.Script == "dev" {
+			return setup.RetainConflict, nil
+		}
+		return setup.ReplaceConflict, nil
+	}
+	if err := setup.Run(request); err != nil {
+		t.Fatalf("rerun Run() error = %v", err)
+	}
+	scripts := readManifestScripts(t, packagePath)
+	if scripts["dev"] != "manual wrapper" || scripts["inject:original:predev"] != "prepare" {
+		t.Errorf("scripts = %#v, want retained wrapper and replaced hook", scripts)
+	}
+	request.ResolveConflict = func(setup.Conflict) (setup.ConflictResolution, error) {
+		t.Fatal("retained entry conflicted again on unchanged rerun")
+		return setup.RetainConflict, nil
+	}
+	if err := setup.Run(request); err != nil {
+		t.Fatalf("unchanged rerun Run() error = %v", err)
+	}
+}
+
+func TestRunAddsAndRemovesProfilesAndPackageScripts(t *testing.T) {
+	directory := t.TempDir()
+	for name, contents := range map[string]string{
+		".env":              "TOKEN=default-secret\n",
+		"package-lock.json": "",
+		"package.json":      `{"scripts":{"dev":"vite","serve":"http-server"}}`,
+	} {
+		if err := os.WriteFile(filepath.Join(directory, name), []byte(contents), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	credentialStore := store.NewMemory()
+	request := setup.Request{Directory: directory, ProjectID: "billing-api", Local: true, SelectedInputs: []string{".env"}, PackageScripts: []string{"dev"}, Confirm: true, Store: credentialStore, Output: io.Discard}
+	if err := setup.Run(request); err != nil {
+		t.Fatalf("first Run() error = %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(directory, ".env.staging"), []byte("TOKEN=staging-secret\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	request.SelectedInputs = []string{".env", ".env.staging"}
+	request.PackageScripts = []string{"dev", "serve"}
+	if err := setup.Run(request); err != nil {
+		t.Fatalf("additions Run() error = %v", err)
+	}
+	if _, err := credentialStore.Get("billing-api", "staging"); err != nil {
+		t.Fatalf("staging profile after addition: %v", err)
+	}
+
+	var output bytes.Buffer
+	request.SelectedInputs = []string{".env"}
+	request.PackageScripts = []string{"dev"}
+	request.Output = &output
+	if err := setup.Run(request); err != nil {
+		t.Fatalf("removals Run() error = %v", err)
+	}
+	if strings.Contains(output.String(), "default-secret") || strings.Contains(output.String(), "staging-secret") {
+		t.Errorf("preview leaked secret values: %q", output.String())
+	}
+	config, err := project.Load(filepath.Join(directory, "inject.toml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, exists := config.Profiles["staging"]; exists {
+		t.Error("staging profile remained in configuration")
+	}
+	if _, exists := config.ScriptBindings["serve"]; exists {
+		t.Error("serve binding remained in configuration")
+	}
+	if _, err := credentialStore.Get("billing-api", "staging"); !errors.Is(err, store.ErrUnavailable) {
+		t.Errorf("staging profile Get() error = %v, want unavailable", err)
+	}
+	scripts := readManifestScripts(t, filepath.Join(directory, "package.json"))
+	if scripts["serve"] != "http-server" {
+		t.Errorf("serve script = %q, want restored original", scripts["serve"])
+	}
+	if _, exists := scripts["inject:original:serve"]; exists {
+		t.Error("generated serve script remained after removal")
+	}
+}
+
+func TestRunRetainsModifiedScriptWhenRemovingBinding(t *testing.T) {
+	directory := t.TempDir()
+	packagePath := filepath.Join(directory, "package.json")
+	if err := os.WriteFile(packagePath, []byte(`{"scripts":{"dev":"vite"}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(directory, "package-lock.json"), nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	request := request(directory, io.Discard)
+	request.PackageScripts = []string{"dev"}
+	request.Confirm = true
+	request.RunValidation = func([]string) error { return nil }
+	if err := setup.Run(request); err != nil {
+		t.Fatalf("first Run() error = %v", err)
+	}
+	scripts := readManifestScripts(t, packagePath)
+	scripts["dev"] = "manual command"
+	writeManifestScripts(t, packagePath, scripts)
+	request.PackageScripts = []string{}
+	request.ResolveConflict = func(setup.Conflict) (setup.ConflictResolution, error) {
+		return setup.RetainConflict, nil
+	}
+
+	if err := setup.Run(request); err != nil {
+		t.Fatalf("removal Run() error = %v", err)
+	}
+	scripts = readManifestScripts(t, packagePath)
+	if scripts["dev"] != "manual command" {
+		t.Errorf("dev script = %q, want retained manual command", scripts["dev"])
+	}
+	if _, exists := scripts["inject:original:dev"]; exists {
+		t.Error("unmodified generated original remained after binding removal")
 	}
 }
 
@@ -1255,6 +1581,32 @@ func request(directory string, output io.Writer) setup.Request {
 			return nil
 		},
 		Output: output,
+	}
+}
+
+func readManifestScripts(t *testing.T, path string) map[string]string {
+	t.Helper()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var manifest struct {
+		Scripts map[string]string `json:"scripts"`
+	}
+	if err := json.Unmarshal(data, &manifest); err != nil {
+		t.Fatal(err)
+	}
+	return manifest.Scripts
+}
+
+func writeManifestScripts(t *testing.T, path string, scripts map[string]string) {
+	t.Helper()
+	data, err := json.Marshal(map[string]any{"scripts": scripts})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		t.Fatal(err)
 	}
 }
 

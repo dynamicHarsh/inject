@@ -48,9 +48,22 @@ type Request struct {
 	NonInteractive      bool
 	CheckOnePassword    func() error
 	RunValidation       func([]string) error
+	ResolveConflict     func(Conflict) (ConflictResolution, error)
 	Store               store.Store
 	Output              io.Writer
 }
+
+type Conflict struct {
+	Script  string
+	current string
+}
+
+type ConflictResolution int
+
+const (
+	RetainConflict ConflictResolution = iota
+	ReplaceConflict
+)
 
 type Plan struct {
 	ProjectID            string
@@ -99,6 +112,19 @@ func Discover(directory string) (Discovery, error) {
 	}
 	inputs := detectPlaintextInputs(directory)
 	scripts := candidatePackageScripts(directory)
+	var existing *project.Config
+	configPath := filepath.Join(directory, project.FileName)
+	if _, exists := statFile(configPath); exists {
+		config, err := project.Load(configPath)
+		if err != nil {
+			return Discovery{}, fmt.Errorf("setup: load existing configuration: %w", err)
+		}
+		existing = &config
+		projectID = config.ProjectID
+		for index := range inputs {
+			_, inputs[index].Selected = config.Profiles[inputs[index].Profile]
+		}
+	}
 	discovery := Discovery{
 		ProjectID:       projectID,
 		PlaintextInputs: inputs,
@@ -108,6 +134,11 @@ func Discover(directory string) (Discovery, error) {
 	if len(inputs) > 0 {
 		discovery.DefaultSource = "local"
 	}
+	if existing != nil {
+		if profile, ok := existing.Profiles["default"]; ok {
+			discovery.DefaultSource = profile.Provider
+		}
+	}
 	for _, input := range inputs {
 		if input.Selected {
 			discovery.SelectedInputs = append(discovery.SelectedInputs, input.Name)
@@ -116,7 +147,11 @@ func Discover(directory string) (Discovery, error) {
 	for _, name := range scripts {
 		command := DeveloperCommand{Name: name, Default: isRuntimeScript(name)}
 		discovery.DeveloperCommands = append(discovery.DeveloperCommands, command)
-		if command.Default {
+		if existing != nil {
+			if _, selected := existing.ScriptBindings[name]; selected {
+				discovery.SelectedCommands = append(discovery.SelectedCommands, name)
+			}
+		} else if command.Default {
 			discovery.SelectedCommands = append(discovery.SelectedCommands, name)
 		}
 		if isFiniteValidationScript(name) {
@@ -139,6 +174,16 @@ func Run(request Request) error {
 	if request.Output == nil {
 		request.Output = io.Discard
 	}
+	configPath := filepath.Join(request.Directory, project.FileName)
+	var existingConfig *project.Config
+	if _, exists := statFile(configPath); exists {
+		existing, err := project.Load(configPath)
+		if err != nil {
+			return fmt.Errorf("setup: load existing configuration: %w", err)
+		}
+		existingConfig = &existing
+		applyExistingDefaults(&request, existing)
+	}
 	legacyEnvPath := filepath.Join(request.Directory, ".env")
 	inputs := detectPlaintextInputs(request.Directory)
 	if err := selectPlaintextInputs(inputs, request.SelectedInputs); err != nil {
@@ -155,8 +200,10 @@ func Run(request Request) error {
 	if err := validateRequest(request); err != nil {
 		return err
 	}
-	if _, exists := statFile(filepath.Join(request.Directory, project.FileName)); exists {
-		return fmt.Errorf("setup: inject.toml already exists")
+	if existingConfig != nil {
+		if existingConfig.ProjectID != request.ProjectID {
+			return fmt.Errorf("setup: existing project ID %q does not match %q", existingConfig.ProjectID, request.ProjectID)
+		}
 	}
 
 	candidates := candidatePackageScripts(request.Directory)
@@ -179,7 +226,11 @@ func Run(request Request) error {
 			return err
 		}
 	}
-	config, err := plan(request, localProfiles)
+	config, err := plan(request, localProfiles, existingConfig)
+	if err != nil {
+		return err
+	}
+	retainedScripts, err := resolveOwnedScriptConflicts(request, existingConfig, &config)
 	if err != nil {
 		return err
 	}
@@ -217,7 +268,20 @@ func Run(request Request) error {
 				return fmt.Errorf("setup: validation failed: %w", err)
 			}
 		}
-		snapshots, err := snapshotProfiles(request.Store, request.ProjectID, localProfiles)
+		affectedProfiles := make(map[string]map[string]string, len(localProfiles))
+		for profile, secrets := range localProfiles {
+			affectedProfiles[profile] = secrets
+		}
+		if existingConfig != nil {
+			for profile, existingProfile := range existingConfig.Profiles {
+				if existingProfile.Provider == "local" {
+					if _, retained := localProfiles[profile]; !retained {
+						affectedProfiles[profile] = nil
+					}
+				}
+			}
+		}
+		snapshots, err := snapshotProfiles(request.Store, request.ProjectID, affectedProfiles)
 		if err != nil {
 			return err
 		}
@@ -233,6 +297,17 @@ func Run(request Request) error {
 				return fmt.Errorf("setup: save local profile %q: %w", profile, err)
 			}
 		}
+		for _, profile := range sortedKeys(affectedProfiles) {
+			if _, retained := localProfiles[profile]; retained {
+				continue
+			}
+			if err := request.Store.Delete(request.ProjectID, profile); err != nil && !errors.Is(err, store.ErrUnavailable) {
+				if rollbackErr := rollbackStore(); rollbackErr != nil {
+					return errors.Join(fmt.Errorf("setup: remove local profile %q: %w", profile, err), rollbackErr)
+				}
+				return fmt.Errorf("setup: remove local profile %q: %w", profile, err)
+			}
+		}
 	}
 
 	if !request.Local {
@@ -240,7 +315,7 @@ func Run(request Request) error {
 			return fmt.Errorf("setup: validation failed: %w", err)
 		}
 	}
-	if err := applyProjectFiles(request.Directory, config, configData, writeFileAtomically); err != nil {
+	if err := applyProjectFiles(request.Directory, existingConfig, config, configData, retainedScripts, writeFileAtomically); err != nil {
 		if rollbackStore != nil {
 			if rollbackErr := rollbackStore(); rollbackErr != nil {
 				return errors.Join(err, rollbackErr)
@@ -260,6 +335,35 @@ func Run(request Request) error {
 		fmt.Fprintln(request.Output, "Removed legacy .env")
 	}
 	return nil
+}
+
+func applyExistingDefaults(request *Request, existing project.Config) {
+	if request.ProjectID == "" {
+		request.ProjectID = existing.ProjectID
+	}
+	if !request.Local && request.Provider == "" && !hasRemoteReference(*request) {
+		if profile, exists := existing.Profiles["default"]; exists {
+			request.Provider = profile.Provider
+			request.Local = profile.Provider == "local"
+			request.Account, request.Vault = profile.Account, profile.Vault
+			request.ItemID, request.Item = profile.ItemID, profile.Item
+			if request.Local {
+				request.Provider = ""
+			}
+		}
+	}
+	if request.SelectedInputs == nil && request.Local {
+		for _, profile := range sortedKeys(existing.Profiles) {
+			name := ".env." + profile
+			if profile == "default" {
+				name = ".env"
+			}
+			request.SelectedInputs = append(request.SelectedInputs, name)
+		}
+	}
+	if request.PackageScripts == nil && request.PackageScript == "" && request.Binding == "" {
+		request.PackageScripts = sortedKeys(existing.ScriptBindings)
+	}
 }
 
 type profileSnapshot struct {
@@ -669,7 +773,7 @@ func checkOnePassword(request Request) error {
 	return nil
 }
 
-func plan(request Request, localProfiles map[string]map[string]string) (project.Config, error) {
+func plan(request Request, localProfiles map[string]map[string]string, existing *project.Config) (project.Config, error) {
 	profile := project.Profile{
 		Provider: effectiveProvider(request), Account: request.Account, Vault: request.Vault, ItemID: request.ItemID, Item: request.Item,
 	}
@@ -693,7 +797,7 @@ func plan(request Request, localProfiles map[string]map[string]string) (project.
 		return config, nil
 	}
 	if len(request.PackageScripts) > 0 {
-		bindings, err := packageScriptBindings(request.Directory, request.PackageScripts)
+		bindings, err := packageScriptBindings(request.Directory, request.PackageScripts, existing)
 		if err != nil {
 			return project.Config{}, err
 		}
@@ -781,7 +885,7 @@ func validatePackageScript(directory, script string) error {
 	return nil
 }
 
-func packageScriptBindings(directory string, selected []string) (map[string]project.ScriptBinding, error) {
+func packageScriptBindings(directory string, selected []string, existing *project.Config) (map[string]project.ScriptBinding, error) {
 	data, err := os.ReadFile(filepath.Join(directory, "package.json"))
 	if err != nil {
 		return nil, fmt.Errorf("setup: read package.json: %w", err)
@@ -798,6 +902,12 @@ func packageScriptBindings(directory string, selected []string) (map[string]proj
 	}
 	bindings := make(map[string]project.ScriptBinding, len(selected))
 	for _, name := range selected {
+		if existing != nil {
+			if binding, owned := existing.ScriptBindings[name]; owned {
+				bindings[name] = binding
+				continue
+			}
+		}
 		original, exists := manifest.Scripts[name]
 		if !exists {
 			return nil, fmt.Errorf("setup: package.json has no %q script", name)
@@ -833,18 +943,105 @@ func packageScriptBindings(directory string, selected []string) (map[string]proj
 	return bindings, nil
 }
 
+func resolveOwnedScriptConflicts(request Request, existing *project.Config, planned *project.Config) (map[string]string, error) {
+	if existing == nil || len(existing.ScriptBindings) == 0 {
+		return nil, nil
+	}
+	data, err := os.ReadFile(filepath.Join(request.Directory, "package.json"))
+	if err != nil {
+		return nil, fmt.Errorf("setup: read package.json: %w", err)
+	}
+	var manifest struct {
+		Scripts map[string]string `json:"scripts"`
+	}
+	if err := json.Unmarshal(data, &manifest); err != nil {
+		return nil, fmt.Errorf("setup: invalid package.json: %w", err)
+	}
+	var conflicts []Conflict
+	for _, name := range sortedKeys(existing.ScriptBindings) {
+		conflicts = append(conflicts, ownedPackageScriptConflicts(name, existing.ScriptBindings[name], manifest.Scripts)...)
+	}
+	if len(conflicts) == 0 {
+		return nil, nil
+	}
+	if request.NonInteractive || request.ResolveConflict == nil {
+		names := make([]string, 0, len(conflicts))
+		for _, conflict := range conflicts {
+			names = append(names, strconv.Quote(conflict.Script))
+		}
+		return nil, fmt.Errorf("setup: owned package scripts were modified: %s", strings.Join(names, ", "))
+	}
+	retained := make(map[string]string)
+	for _, conflict := range conflicts {
+		resolution, err := request.ResolveConflict(conflict)
+		if err != nil {
+			return nil, err
+		}
+		if resolution == RetainConflict {
+			retained[conflict.Script] = conflict.current
+			adoptRetainedScript(planned, conflict)
+		}
+	}
+	return retained, nil
+}
+
+func adoptRetainedScript(config *project.Config, conflict Conflict) {
+	for name, binding := range config.ScriptBindings {
+		switch conflict.Script {
+		case name:
+			binding.Wrapper = conflict.current
+		case binding.Script:
+			binding.Original = conflict.current
+		case binding.PreScript:
+			binding.PreOriginal = conflict.current
+		case binding.PostScript:
+			binding.PostOriginal = conflict.current
+		default:
+			continue
+		}
+		config.ScriptBindings[name] = binding
+		return
+	}
+}
+
+func ownedPackageScriptConflicts(name string, binding project.ScriptBinding, scripts map[string]string) []Conflict {
+	expected := map[string]string{name: binding.Wrapper, binding.Script: binding.Original}
+	if binding.PreScript != "" {
+		expected[binding.PreScript] = binding.PreOriginal
+	}
+	if binding.PostScript != "" {
+		expected[binding.PostScript] = binding.PostOriginal
+	}
+	var conflicts []Conflict
+	for _, entry := range sortedKeys(expected) {
+		if scripts[entry] != expected[entry] {
+			conflicts = append(conflicts, Conflict{Script: entry, current: scripts[entry]})
+		}
+	}
+	for _, lifecycle := range []string{"pre" + name, "post" + name} {
+		if _, exists := scripts[lifecycle]; exists {
+			conflicts = append(conflicts, Conflict{Script: lifecycle, current: scripts[lifecycle]})
+		}
+	}
+	return conflicts
+}
+
 func reservedScriptName(name string) string { return "inject:original:" + name }
 
-func applyProjectFiles(directory string, config project.Config, configData []byte, writeFile func(string, []byte, os.FileMode) error) error {
+func applyProjectFiles(directory string, existing *project.Config, config project.Config, configData []byte, retainedScripts map[string]string, writeFile func(string, []byte, os.FileMode) error) error {
 	manifestPath := filepath.Join(directory, "package.json")
 	var originalManifest []byte
-	if len(config.ScriptBindings) > 0 {
+	var existingBindings map[string]project.ScriptBinding
+	if existing != nil {
+		existingBindings = existing.ScriptBindings
+	}
+	if len(existingBindings) > 0 || len(config.ScriptBindings) > 0 {
 		var err error
 		originalManifest, err = os.ReadFile(manifestPath)
 		if err != nil {
 			return fmt.Errorf("setup: read package.json: %w", err)
 		}
-		updatedManifest, err := rewritePackageScripts(originalManifest, config.ScriptBindings)
+		updatedManifest, err := rewritePackageScripts(originalManifest, existingBindings, config.ScriptBindings, retainedScripts)
 		if err != nil {
 			return err
 		}
@@ -889,7 +1086,7 @@ func writeFileAtomically(path string, data []byte, mode os.FileMode) (err error)
 	return os.Rename(temporaryPath, path)
 }
 
-func rewritePackageScripts(data []byte, bindings map[string]project.ScriptBinding) ([]byte, error) {
+func rewritePackageScripts(data []byte, existing, bindings map[string]project.ScriptBinding, retained map[string]string) ([]byte, error) {
 	var manifest map[string]json.RawMessage
 	if err := json.Unmarshal(data, &manifest); err != nil {
 		return nil, fmt.Errorf("setup: invalid package.json: %w", err)
@@ -897,6 +1094,33 @@ func rewritePackageScripts(data []byte, bindings map[string]project.ScriptBindin
 	var scripts map[string]string
 	if err := json.Unmarshal(manifest["scripts"], &scripts); err != nil {
 		return nil, fmt.Errorf("setup: invalid package.json scripts: %w", err)
+	}
+	for name, binding := range existing {
+		if _, retained := bindings[name]; retained {
+			continue
+		}
+		if _, keep := retained[name]; !keep {
+			scripts[name] = binding.Original
+		}
+		if _, keep := retained[binding.Script]; !keep {
+			delete(scripts, binding.Script)
+		}
+		if binding.PreScript != "" {
+			if _, keep := retained["pre"+name]; !keep {
+				scripts["pre"+name] = binding.PreOriginal
+			}
+			if _, keep := retained[binding.PreScript]; !keep {
+				delete(scripts, binding.PreScript)
+			}
+		}
+		if binding.PostScript != "" {
+			if _, keep := retained["post"+name]; !keep {
+				scripts["post"+name] = binding.PostOriginal
+			}
+			if _, keep := retained[binding.PostScript]; !keep {
+				delete(scripts, binding.PostScript)
+			}
+		}
 	}
 	for name, binding := range bindings {
 		scripts[binding.Script] = binding.Original
@@ -938,7 +1162,7 @@ func candidatePackageScripts(directory string) []string {
 		candidates = append(candidates, "dev")
 	}
 	for name := range manifest.Scripts {
-		if name != "dev" {
+		if name != "dev" && !strings.HasPrefix(name, "inject:original:") {
 			candidates = append(candidates, name)
 		}
 	}

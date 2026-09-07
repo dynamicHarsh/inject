@@ -113,7 +113,7 @@ func TestPromptSetupDrivesDetectedChoicesWithoutTerminal(t *testing.T) {
 		PackageManager:       "npm",
 	}
 	var output bytes.Buffer
-	input := &responseReader{responses: []string{"billing-api", "1", "unused-account", "unused-vault", "unused-id", "", "unused-id", "", "0", "0", "2", "unused", "n", "y"}}
+	input := &responseReader{responses: []string{"billing-api", "1", "unused-account", "unused-vault", "unused-id", "", "unused-id", "", "0", "0", "2", "unused", "n", "y", "2"}}
 
 	request, err := promptSetupWithIO(discovery, setupworkflow.Request{Output: &output}, input, &output, true)
 	if err != nil {
@@ -127,6 +127,13 @@ func TestPromptSetupDrivesDetectedChoicesWithoutTerminal(t *testing.T) {
 	}
 	if !reflect.DeepEqual(request.Validate, []string{"npm", "run", "test"}) {
 		t.Errorf("validation = %q, want npm run test", request.Validate)
+	}
+	resolution, err := request.ResolveConflict(setupworkflow.Conflict{Script: "dev"})
+	if err != nil {
+		t.Fatalf("ResolveConflict() error = %v", err)
+	}
+	if resolution != setupworkflow.ReplaceConflict {
+		t.Errorf("resolution = %v, want explicit replacement", resolution)
 	}
 	for _, message := range []string{"Project ID", "Secret source", "Environment inputs and profiles", "Developer commands", "Finite validation command", "Review setup", "Applying setup..."} {
 		if !strings.Contains(output.String(), message) {

@@ -23,7 +23,7 @@ func TestApplyProjectFilesReportsCommitAndRollbackFailures(t *testing.T) {
 	rollbackErr := errors.New("manifest rollback unavailable")
 	writes := 0
 
-	err := applyProjectFiles(directory, config, []byte("config"), func(path string, data []byte, mode os.FileMode) error {
+	err := applyProjectFiles(directory, nil, config, []byte("config"), nil, func(path string, data []byte, mode os.FileMode) error {
 		writes++
 		switch writes {
 		case 1:
